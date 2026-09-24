@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parça Kontrol – AR Testi</title>
+<style>
+  body { margin: 0; background: #1c1f24; color: #e8e8e8; font-family: system-ui, sans-serif; }
+  #bilgi {
+    position: absolute; top: 0; left: 0; right: 0;
+    padding: 14px 16px; font-size: 15px; line-height: 1.4; text-align: center;
+  }
+</style>
+</head>
+<body>
+<div id="bilgi">
+  Parça Kontrol – AR testi.<br>
+  Alttaki "START AR" düğmesine bas, kameraya izin ver, telefonu masaya doğrult.
+  Yeşil halka göründüğünde ekrana dokun: turuncu bir küp yerleşir ve sen hareket etsen de yerinde kalır.
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+let kamera, sahne, renderer, kontrolcu, halka;
+let hitTestKaynagi = null;
+let hitTestIstendi = false;
+
+baslat();
+
+function baslat() {
+  sahne = new THREE.Scene();
+
+  // Birimler metre: 0.01 m'den 20 m'ye kadar çizim yapılır
+  kamera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+  const isik = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 3);
+  isik.position.set(0.5, 1, 0.25);
+  sahne.add(isik);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  // AR oturumunu başlatan düğme; cihaz desteklemiyorsa kendisi "AR NOT SUPPORTED" yazar
+  document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] }));
+
+  // Ekrana dokununca yerleştirilecek nesne: 4 cm'lik küp
+  const kupGeometri = new THREE.BoxGeometry(0.04, 0.04, 0.04).translate(0, 0.02, 0);
+
+  kontrolcu = renderer.xr.getController(0);
+  kontrolcu.addEventListener('select', () => {
+    if (halka.visible) {
+      const kup = new THREE.Mesh(kupGeometri, new THREE.MeshStandardMaterial({ color: 0xff6a00 }));
+      halka.matrix.decompose(kup.position, kup.quaternion, kup.scale);
+      sahne.add(kup);
+    }
+  });
+  sahne.add(kontrolcu);
+
+  // Yüzey bulununca gösterilen yeşil halka
+  halka = new THREE.Mesh(
+    new THREE.RingGeometry(0.03, 0.04, 32).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0x2ecc71 })
+  );
+  halka.matrixAutoUpdate = false;
+  halka.visible = false;
+  sahne.add(halka);
+
+  window.addEventListener('resize', boyutDegisti);
+  renderer.setAnimationLoop(ciz);
+}
+
+function boyutDegisti() {
+  kamera.aspect = window.innerWidth / window.innerHeight;
+  kamera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function ciz(zaman, frame) {
+  if (frame) {
+    const referansAlani = renderer.xr.getReferenceSpace();
+    const oturum = renderer.xr.getSession();
+
+    if (!hitTestIstendi) {
+      oturum.requestReferenceSpace('viewer').then((bakisAlani) => {
+        oturum.requestHitTestSource({ space: bakisAlani }).then((kaynak) => {
+          hitTestKaynagi = kaynak;
+        });
+      });
+      oturum.addEventListener('end', () => {
+        hitTestIstendi = false;
+        hitTestKaynagi = null;
+      });
+      hitTestIstendi = true;
+    }
+
+    if (hitTestKaynagi) {
+      const sonuclar = frame.getHitTestResults(hitTestKaynagi);
+      if (sonuclar.length) {
+        halka.visible = true;
+        halka.matrix.fromArray(sonuclar[0].getPose(referansAlani).transform.matrix);
+      } else {
+        halka.visible = false;
+      }
+    }
+  }
+  renderer.render(sahne, kamera);
+}
+</script>
+</body>
+</html>

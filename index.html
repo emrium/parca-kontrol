@@ -76,9 +76,9 @@ const ISARET_GENISLIK = ISARET_GENISLIK_MM / 1000;
 const PARCA_OFSET = (PARCA_OFSET_MM / 1000) * (ISARET_GENISLIK_MM / 100); // baskı ölçeği farklıysa ofset de aynı oranda değişir
 // İşaret uzayı (Chrome/ARCore): düzlem XZ, +Y kağıttan dışa (normal), +X sağa, +Z sayfada aşağı doğru.
 // Modelin +Y'si zaten normalle aynı, ek dönüş gerekmez.
-const DUZELTME_ESIGI_M = 0.012;  // yerleşik modelle yeni işaret pozu arasındaki fark bundan büyükse düzelt (12 mm)
-const DUZELTME_ESIGI_DERECE = 4; // ... ya da açı farkı bundan büyükse
-const YUMUSATMA = 0.15;          // düzeltme hızı (0-1, 1 = anında)
+const ORNEK_SAYISI = 40;         // kilitlemeden önce işaret pozunun kaç kare ortalaması alınacak (~0,7 s)
+const YENIDEN_KILIT_M = 0.03;    // işaret, kilitli konumdan bu kadar (30 mm) uzakta görülürse kağıt oynamış say, yeniden kilitle
+const YENIDEN_KILIT_KARE = 45;   // ... ve bu sapma en az bu kadar kare art arda sürmeli
 
 let kamera, sahne, renderer, kontrolcu, halka, isaretCerceve;
 let model = null;
@@ -86,7 +86,13 @@ let yerlesik = false;
 let takipModu = 'isaret';        // 'isaret': işareti izle, 'elle': dokunarak yerleştirildi
 let isaretTakibiVar = false;
 let sonIsaretDurumu = '';
-let yenidenOtur = false;         // İşarete kilitle'ye basılınca bir sonraki görüşte anında yerleş
+let ornekler = [];               // kilitleme öncesi toplanan işaret pozları
+let kilitli = false;             // işaret pozu kilitlendi mi
+let capa = null;                 // WebXR anchor (ARCore çapası): dünyaya sabitlenmiş nokta
+let capaIsteniyor = false;
+let sabitMatris = null;          // çapa desteklenmiyorsa kullanılan sabit poz
+let sapmaKare = 0;
+const _mat = new THREE.Matrix4();
 let hitTestKaynagi = null;
 let hitTestIstendi = false;
 let isaretBitmap = null;
@@ -151,9 +157,9 @@ function baslat() {
   btnCik.addEventListener('click', () => { if (oturum) oturum.end(); });
   btnKilitle.addEventListener('click', () => {
     takipModu = 'isaret';
-    yenidenOtur = true;
+    kilidiAc();
     btnKilitle.disabled = true;
-    bilgi.textContent = 'İşarete kilitlendi. Kamerayı işarete doğrult.';
+    bilgi.textContent = 'Kamerayı işarete doğrult ve ölçüm bitene kadar sabit tut.';
   });
   btnDondur.addEventListener('click', () => {
     if (yerlesik) model.rotateY(THREE.MathUtils.degToRad(15));
@@ -188,7 +194,7 @@ async function arBaslat() {
   if (!navigator.xr) { bilgi.textContent = 'Bu tarayıcı WebXR desteklemiyor. Android Chrome kullan.'; return; }
   if (!(await navigator.xr.isSessionSupported('immersive-ar'))) { bilgi.textContent = 'Bu cihazda AR desteklenmiyor.'; return; }
 
-  const temel = { requiredFeatures: ['hit-test', 'dom-overlay'], domOverlay: { root: document.body } };
+  const temel = { requiredFeatures: ['hit-test', 'dom-overlay'], optionalFeatures: ['anchors'], domOverlay: { root: document.body } };
   try {
     if (!isaretBitmap) throw new Error('işaret yok');
     oturum = await navigator.xr.requestSession('immersive-ar', {
@@ -232,6 +238,7 @@ async function arBaslat() {
     hitTestIstendi = false; hitTestKaynagi = null;
     if (yerlesik) { sahne.remove(model); yerlesik = false; }
     takipModu = 'isaret';
+    kilidiAc();
     isaretCerceve.visible = false; halka.visible = false;
     btnBasla.classList.remove('gizli');
     [btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.add('gizli'));
@@ -268,28 +275,80 @@ function modeliGoster() {
   }
 }
 
-// İşaret pozundan modeli yerleştir: işaret merkezinden sayfa boyunca aşağı (+Z) PARCA_OFSET kadar
-function isareteOtur(matris) {
+// Verilen işaret pozundan (matris) modeli yerleştir: işaret merkezinden sayfa boyunca aşağı (+Z) PARCA_OFSET kadar
+function modeliIsaretPozunaKoy(matris) {
   matris.decompose(_poz, _don, _olc);
   _ofset.set(0, 0, PARCA_OFSET).applyQuaternion(_don);   // sayfada aşağı = +Z
-  _poz.add(_ofset);
-  if (!yerlesik || yenidenOtur) {
-    // İlk görüşte (ya da istek üzerine) anında yerleş
-    model.position.copy(_poz);
-    model.quaternion.copy(_don);
-    yenidenOtur = false;
-  } else {
-    // Yerleşik model sabit kalır; işaret pozu belirgin sapma gösterirse yumuşak düzelt.
-    // Böylece küçük ölçüm titremeleri modele yansımaz.
-    const konumFarki = model.position.distanceTo(_poz);
-    const aciFarki = THREE.MathUtils.radToDeg(model.quaternion.angleTo(_don));
-    if (konumFarki > DUZELTME_ESIGI_M || aciFarki > DUZELTME_ESIGI_DERECE) {
-      model.position.lerp(_poz, YUMUSATMA);
-      model.quaternion.slerp(_don, YUMUSATMA);
-    }
-  }
+  model.position.copy(_poz).add(_ofset);
+  model.quaternion.copy(_don);
   model.scale.set(1, 1, 1);
   modeliGoster();
+}
+
+// İşaret her karede görüldüğünde çağrılır. Önce ORNEK_SAYISI kare ölçüm toplar, ortalamasını alır,
+// sonra o pozu ARCore çapasına (anchor) bağlar. Çapa, dünyadaki sabit bir noktadır: ARCore kendi
+// haritasını düzelttiğinde çapayı da taşır, bu yüzden model kağıda göre kaymaz. Kilitlendikten sonra
+// işaretin anlık ölçümleri modele yansımaz; yalnızca kağıt gerçekten oynamışsa yeniden kilitlenir.
+function isaretGoruldu(poz, frame, referansAlani) {
+  const t = poz.transform;
+  if (!kilitli) {
+    if (capaIsteniyor) return;
+    ornekler.push({ p: [t.position.x, t.position.y, t.position.z], q: [t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w] });
+    durum.textContent = `İşaret ölçülüyor ${ornekler.length}/${ORNEK_SAYISI} — telefonu sabit tut`;
+    if (ornekler.length >= ORNEK_SAYISI) kilitle(ortalamaPoz(ornekler), frame, referansAlani);
+    return;
+  }
+  // Kilitli: kağıt oynamış mı? İşaretin görülen konumu kilitli konumdan uzun süre uzaksa yeniden kilitle
+  const kilitliPoz = capa ? frame.getPose(capa.anchorSpace, referansAlani) : null;
+  const kp = kilitliPoz ? kilitliPoz.transform.position : (sabitMatris ? { x: sabitMatris.elements[12], y: sabitMatris.elements[13], z: sabitMatris.elements[14] } : null);
+  if (kp) {
+    const d = Math.hypot(t.position.x - kp.x, t.position.y - kp.y, t.position.z - kp.z);
+    sapmaKare = d > YENIDEN_KILIT_M ? sapmaKare + 1 : 0;
+    if (sapmaKare >= YENIDEN_KILIT_KARE) {
+      kilidiAc();
+      bilgi.textContent = 'İşaret yer değiştirmiş görünüyor, yeniden ölçülüyor. Telefonu sabit tut.';
+    }
+  }
+}
+
+// Konumların ortancası (uç ölçümleri eler) ve yönelimlerin ortalaması
+function ortalamaPoz(ornekler) {
+  const ortanca = (dizi) => { const s = [...dizi].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+  const p = [0, 1, 2].map(i => ortanca(ornekler.map(o => o.p[i])));
+  const q0 = ornekler[0].q;
+  const q = [0, 0, 0, 0];
+  for (const o of ornekler) {
+    const isaret = (o.q[0]*q0[0] + o.q[1]*q0[1] + o.q[2]*q0[2] + o.q[3]*q0[3]) < 0 ? -1 : 1;
+    for (let i = 0; i < 4; i++) q[i] += isaret * o.q[i];
+  }
+  const n = Math.hypot(...q);
+  return { position: { x: p[0], y: p[1], z: p[2], w: 1 }, orientation: { x: q[0]/n, y: q[1]/n, z: q[2]/n, w: q[3]/n } };
+}
+
+function kilitle(poz, frame, referansAlani) {
+  const sabitle = () => {
+    sabitMatris = new THREE.Matrix4().compose(
+      new THREE.Vector3(poz.position.x, poz.position.y, poz.position.z),
+      new THREE.Quaternion(poz.orientation.x, poz.orientation.y, poz.orientation.z, poz.orientation.w),
+      new THREE.Vector3(1, 1, 1));
+    kilitli = true; capaIsteniyor = false;
+    durum.textContent = 'İşarete kilitlendi (sabit poz)';
+  };
+  if (typeof frame.createAnchor === 'function') {
+    capaIsteniyor = true;
+    frame.createAnchor(new XRRigidTransform(poz.position, poz.orientation), referansAlani)
+      .then((a) => { capa = a; kilitli = true; capaIsteniyor = false; durum.textContent = 'İşarete kilitlendi (çapa). Artık serbestçe dolaşabilirsin.'; })
+      .catch(sabitle);
+  } else {
+    sabitle();
+  }
+  bilgi.textContent = 'Model işarete göre yerleşti. Küpü kağıttaki kutuya koy ve karşılaştır.';
+}
+
+function kilidiAc() {
+  if (capa && typeof capa.delete === 'function') { try { capa.delete(); } catch (e) {} }
+  capa = null; sabitMatris = null; kilitli = false; capaIsteniyor = false;
+  ornekler = []; sapmaKare = 0;
 }
 
 function elleYerlestir() {
@@ -338,17 +397,24 @@ function ciz(zaman, frame) {
         if (sonuc.trackingState === 'tracked') {
           isaretCerceve.matrix.fromArray(poz.transform.matrix);
           isaretCerceve.visible = true;
-          if (model && takipModu === 'isaret') isareteOtur(isaretCerceve.matrix);
-          durumMetni = `İşaret görüldü (ölçülen genişlik ${(sonuc.measuredWidthInMeters * 1000).toFixed(0)} mm)`;
+          if (model && takipModu === 'isaret') isaretGoruldu(poz, frame, referansAlani);
+          durumMetni = kilitli ? `İşaret görüldü (ölçülen genişlik ${(sonuc.measuredWidthInMeters * 1000).toFixed(0)} mm)` : '';
         } else {
-          durumMetni = 'İşaret görüş dışında, takip sürüyor';
+          durumMetni = kilitli ? 'İşaret görüş dışında, çapa takipte' : 'İşaret görünmüyor';
         }
       }
-      if (durumMetni !== sonIsaretDurumu) {
+      if (durumMetni && durumMetni !== sonIsaretDurumu) {
         sonIsaretDurumu = durumMetni;
         durum.textContent = durumMetni;
-        if (durumMetni.startsWith('İşaret görüldü') && takipModu === 'isaret') {
-          bilgi.textContent = 'Model işarete göre yerleşti. Küpü kağıttaki kutuya koy ve karşılaştır.';
+      }
+
+      // Kilitliyse model her karede çapanın (ya da sabit pozun) yerine oturur; işaret görünmese de.
+      if (kilitli && model && takipModu === 'isaret') {
+        if (capa) {
+          const cp = frame.getPose(capa.anchorSpace, referansAlani);
+          if (cp) { _mat.fromArray(cp.transform.matrix); modeliIsaretPozunaKoy(_mat); }
+        } else if (sabitMatris) {
+          modeliIsaretPozunaKoy(sabitMatris);
         }
       }
     }

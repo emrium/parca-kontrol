@@ -79,6 +79,8 @@ const PARCA_OFSET_MM = 100;       // işaret merkezinden parça yerinin merkezin
 const ORNEK_SAYISI = 40;          // kilitlemeden önce işaret pozunun kaç kare ortalaması alınacak (~0,7 s)
 const YENIDEN_KILIT_M = 0.03;     // işaret, kilitli konumdan bu kadar (30 mm) uzakta görülürse kağıt oynamış say
 const YENIDEN_KILIT_KARE = 45;    // ... ve bu sapma en az bu kadar kare art arda sürmeli
+const ISARET_YATAY = true;        // işaret yatay bir masada duruyor: normali yukarı bakmayan ölçümler elenir
+const MAKS_EGIM_DERECE = 20;      // işaret normali ile "yukarı" arasındaki izin verilen en büyük açı
 
 // ---- Kontrol bölgeleri -----------------------------------------------
 // Koordinatlar model uzayında, mm; orijin modelin TABAN MERKEZİ (uygulama modeli böyle yerleştirir).
@@ -144,6 +146,7 @@ let capa = null;
 let capaIsteniyor = false;
 let sabitMatris = null;
 let sapmaKare = 0;
+let elenenOrnek = 0;
 
 let kontrolIstendi = false;
 let glBinding = null;
@@ -359,6 +362,18 @@ function isaretGoruldu(poz, frame, referansAlani) {
   const t = poz.transform;
   if (!kilitli) {
     if (capaIsteniyor) return;
+    // Düz bir kağıdın pozu, özellikle yatık açıdan bakınca iki farklı çözüme oturabilir (düzlem belirsizliği).
+    // İşaret masada yatay durduğu için normali yukarı bakmayan ölçümleri baştan eliyoruz.
+    if (ISARET_YATAY) {
+      _don.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+      const normalDunya = _poz.set(0, 1, 0).applyQuaternion(_don);
+      const egim = THREE.MathUtils.radToDeg(Math.acos(THREE.MathUtils.clamp(normalDunya.y, -1, 1)));
+      if (egim > MAKS_EGIM_DERECE) {
+        elenenOrnek++;
+        if (elenenOrnek % 15 === 0) durum.textContent = 'İşaret ölçümü güvenilir değil — telefonu işaretin üstüne getir, daha dik bak';
+        return;
+      }
+    }
     ornekler.push({ p: [t.position.x, t.position.y, t.position.z], q: [t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w] });
     durum.textContent = `İşaret ölçülüyor ${ornekler.length}/${ORNEK_SAYISI} — telefonu sabit tut`;
     if (ornekler.length >= ORNEK_SAYISI) kilitle(ortalamaPoz(ornekler), frame, referansAlani);
@@ -376,17 +391,28 @@ function isaretGoruldu(poz, frame, referansAlani) {
   }
 }
 
+// Dayanıklı ortalama: önce diğerlerine en çok benzeyen yönelimi (medoid) bul, ona 4°'den yakın
+// ölçümleri al, yalnızca onların ortalamasını/ortancasını kullan. Böylece tek tük bozuk ölçüm sonucu çevirmez.
 function ortalamaPoz(ornekler) {
+  const mutlakNokta = (a, b) => Math.abs(a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]);
+  let medoid = ornekler[0], enIyi = -1;
+  for (const a of ornekler) {
+    let toplam = 0;
+    for (const b of ornekler) toplam += mutlakNokta(a.q, b.q);
+    if (toplam > enIyi) { enIyi = toplam; medoid = a; }
+  }
+  const esik = Math.cos(THREE.MathUtils.degToRad(4) / 2);            // quaternion iç çarpımı ↔ açı
+  let icerde = ornekler.filter(o => mutlakNokta(o.q, medoid.q) >= esik);
+  if (icerde.length < 5) icerde = [medoid];
   const ortanca = (dizi) => { const s = [...dizi].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
-  const p = [0, 1, 2].map(i => ortanca(ornekler.map(o => o.p[i])));
-  const q0 = ornekler[0].q;
+  const p = [0, 1, 2].map(i => ortanca(icerde.map(o => o.p[i])));
   const q = [0, 0, 0, 0];
-  for (const o of ornekler) {
-    const isaret = (o.q[0]*q0[0] + o.q[1]*q0[1] + o.q[2]*q0[2] + o.q[3]*q0[3]) < 0 ? -1 : 1;
+  for (const o of icerde) {
+    const isaret = (o.q[0]*medoid.q[0] + o.q[1]*medoid.q[1] + o.q[2]*medoid.q[2] + o.q[3]*medoid.q[3]) < 0 ? -1 : 1;
     for (let i = 0; i < 4; i++) q[i] += isaret * o.q[i];
   }
   const n = Math.hypot(...q);
-  return { position: { x: p[0], y: p[1], z: p[2], w: 1 }, orientation: { x: q[0]/n, y: q[1]/n, z: q[2]/n, w: q[3]/n } };
+  return { position: { x: p[0], y: p[1], z: p[2], w: 1 }, orientation: { x: q[0]/n, y: q[1]/n, z: q[2]/n, w: q[3]/n }, kullanilan: icerde.length };
 }
 
 function kilitle(poz, frame, referansAlani) {
@@ -401,7 +427,7 @@ function kilitle(poz, frame, referansAlani) {
   if (typeof frame.createAnchor === 'function') {
     capaIsteniyor = true;
     frame.createAnchor(new XRRigidTransform(poz.position, poz.orientation), referansAlani)
-      .then((a) => { capa = a; kilitli = true; capaIsteniyor = false; durum.textContent = 'İşarete kilitlendi (çapa).'; })
+      .then((a) => { capa = a; kilitli = true; capaIsteniyor = false; durum.textContent = `İşarete kilitlendi (çapa, ${poz.kullanilan || ORNEK_SAYISI} tutarlı ölçüm).`; })
       .catch(sabitle);
   } else {
     sabitle();
@@ -412,7 +438,7 @@ function kilitle(poz, frame, referansAlani) {
 function kilidiAc() {
   if (capa && typeof capa.delete === 'function') { try { capa.delete(); } catch (e) {} }
   capa = null; sabitMatris = null; kilitli = false; capaIsteniyor = false;
-  ornekler = []; sapmaKare = 0;
+  ornekler = []; sapmaKare = 0; elenenOrnek = 0;
 }
 
 function elleYerlestir() {

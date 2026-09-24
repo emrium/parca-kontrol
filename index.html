@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Parça Kontrol – Model Yerleştirme</title>
+<title>Parça Kontrol – İşaretle Hizalama</title>
 <style>
   body { margin: 0; background: #1c1f24; color: #e8e8e8; font-family: system-ui, sans-serif; }
   #bilgi {
@@ -11,22 +11,32 @@
     padding: 14px 16px; font-size: 15px; line-height: 1.4; text-align: center;
     text-shadow: 0 1px 3px rgba(0,0,0,.8);
   }
+  #durum {
+    position: absolute; top: 96px; left: 0; right: 0; text-align: center;
+    font-size: 13px; text-shadow: 0 1px 3px rgba(0,0,0,.8);
+  }
   #arac {
-    position: absolute; bottom: 80px; left: 0; right: 0;
-    display: flex; justify-content: center; gap: 10px;
+    position: absolute; bottom: 24px; left: 0; right: 0;
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; padding: 0 12px;
   }
   #arac button {
     padding: 12px 18px; font-size: 15px; border: 0; border-radius: 8px;
     background: rgba(255,255,255,.9); color: #1c1f24;
   }
   #arac button:disabled { opacity: .4; }
+  #basla { background: #2ecc71; font-weight: 600; }
+  .gizli { display: none !important; }
 </style>
 </head>
 <body>
 <div id="bilgi">Model yükleniyor...</div>
+<div id="durum"></div>
 <div id="arac">
-  <button id="dondur" disabled>Döndür 15°</button>
-  <button id="kaldir" disabled>Kaldır</button>
+  <button id="basla">AR'ı başlat</button>
+  <button id="kilitle" class="gizli" disabled>İşarete kilitle</button>
+  <button id="dondur" class="gizli" disabled>Döndür 15°</button>
+  <button id="kaldir" class="gizli" disabled>Kaldır</button>
+  <button id="cik" class="gizli">Çık</button>
 </div>
 
 <script type="importmap">
@@ -40,29 +50,48 @@
 
 <script type="module">
 import * as THREE from 'three';
-import { ARButton } from 'three/addons/webxr/ARButton.js';
 import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
-// ---- Ayarlar: gerçek parçaya geçince burayı değiştirmek yeter ----
+// ---- Ayarlar ---------------------------------------------------------
 const MODEL_OBJ = 'parca.obj';
 const MODEL_MTL = 'parca.mtl';
-const MODEL_OLCEK = 0.001;      // model mm ise 0.001 (Three.js metre kullanır), cm ise 0.01
-// -------------------------------------------------------------------
+const MODEL_OLCEK = 0.001;        // model mm ise 0.001 (Three.js metre kullanır)
+
+const ISARET_DOSYA = 'isaret.png';
+const ISARET_GENISLIK_MM = 100;   // kağıttaki işaretin cetvelle ölçülen dış genişliği
+const PARCA_OFSET_MM = 100;       // işaret merkezinden parça yerinin merkezine, sayfada aşağı doğru (%100 baskıda)
+// ----------------------------------------------------------------------
 
 const bilgi = document.getElementById('bilgi');
+const durum = document.getElementById('durum');
 const arac = document.getElementById('arac');
+const btnBasla = document.getElementById('basla');
+const btnKilitle = document.getElementById('kilitle');
 const btnDondur = document.getElementById('dondur');
 const btnKaldir = document.getElementById('kaldir');
+const btnCik = document.getElementById('cik');
 
-let kamera, sahne, renderer, kontrolcu, halka;
-let model = null;          // yüklenen model (henüz sahnede değil)
-let yerlesik = false;      // model sahneye yerleştirildi mi
+const ISARET_GENISLIK = ISARET_GENISLIK_MM / 1000;
+const PARCA_OFSET = (PARCA_OFSET_MM / 1000) * (ISARET_GENISLIK_MM / 100); // baskı ölçeği farklıysa ofset de aynı oranda değişir
+const DIK = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2); // modelin +Y'sini işaretin normaline çevirir
+
+let kamera, sahne, renderer, kontrolcu, halka, isaretCerceve;
+let model = null;
+let yerlesik = false;
+let takipModu = 'isaret';        // 'isaret': işareti izle, 'elle': dokunarak yerleştirildi
+let isaretTakibiVar = false;
+let sonIsaretDurumu = '';
 let hitTestKaynagi = null;
 let hitTestIstendi = false;
+let isaretBitmap = null;
+let oturum = null;
+
+const _poz = new THREE.Vector3(), _don = new THREE.Quaternion(), _olc = new THREE.Vector3(), _ofset = new THREE.Vector3();
 
 baslat();
 modeliYukle();
+isaretiHazirla();
 
 function baslat() {
   sahne = new THREE.Scene();
@@ -77,22 +106,17 @@ function baslat() {
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.xr.enabled = true;
+  renderer.xr.setReferenceSpaceType('local');
   document.body.appendChild(renderer.domElement);
-
-  // dom-overlay: AR açıkken üstteki yazı ve düğmeler görünür kalır
-  document.body.appendChild(ARButton.createButton(renderer, {
-    requiredFeatures: ['hit-test'],
-    optionalFeatures: ['dom-overlay'],
-    domOverlay: { root: document.body }
-  }));
 
   // Düğmelere dokunmak sahneye "yerleştir" olarak sayılmasın
   arac.addEventListener('beforexrselect', (e) => e.preventDefault());
 
   kontrolcu = renderer.xr.getController(0);
-  kontrolcu.addEventListener('select', yerlestir);
+  kontrolcu.addEventListener('select', elleYerlestir);
   sahne.add(kontrolcu);
 
+  // Yüzey halkası (elle yerleştirme için)
   halka = new THREE.Mesh(
     new THREE.RingGeometry(0.03, 0.04, 32).rotateX(-Math.PI / 2),
     new THREE.MeshBasicMaterial({ color: 0x2ecc71 })
@@ -101,6 +125,26 @@ function baslat() {
   halka.visible = false;
   sahne.add(halka);
 
+  // İşaretin görüldüğü yerde çizilen çerçeve (kontrol amaçlı)
+  const y = ISARET_GENISLIK / 2;
+  isaretCerceve = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-y, -y, 0), new THREE.Vector3(y, -y, 0),
+      new THREE.Vector3(y, y, 0), new THREE.Vector3(-y, y, 0)
+    ]),
+    new THREE.LineBasicMaterial({ color: 0x2ecc71 })
+  );
+  isaretCerceve.matrixAutoUpdate = false;
+  isaretCerceve.visible = false;
+  sahne.add(isaretCerceve);
+
+  btnBasla.addEventListener('click', arBaslat);
+  btnCik.addEventListener('click', () => { if (oturum) oturum.end(); });
+  btnKilitle.addEventListener('click', () => {
+    takipModu = 'isaret';
+    btnKilitle.disabled = true;
+    bilgi.textContent = 'İşarete kilitlendi. Kamerayı işarete doğrult.';
+  });
   btnDondur.addEventListener('click', () => {
     if (yerlesik) model.rotateY(THREE.MathUtils.degToRad(15));
   });
@@ -108,13 +152,82 @@ function baslat() {
     if (yerlesik) {
       sahne.remove(model);
       yerlesik = false;
+      takipModu = 'elle';
       btnDondur.disabled = btnKaldir.disabled = true;
-      bilgi.textContent = 'Yeşil halka göründüğünde ekrana dokun.';
+      btnKilitle.disabled = false;
+      bilgi.textContent = 'Model kaldırıldı. Halkaya dokun ya da İşarete kilitle.';
     }
   });
 
   window.addEventListener('resize', boyutDegisti);
   renderer.setAnimationLoop(ciz);
+}
+
+async function isaretiHazirla() {
+  try {
+    const img = new Image();
+    img.src = ISARET_DOSYA;
+    await img.decode();
+    isaretBitmap = await createImageBitmap(img);
+  } catch (e) {
+    durum.textContent = 'İşaret görüntüsü yüklenemedi: ' + ISARET_DOSYA + ' depoda var mı?';
+  }
+}
+
+async function arBaslat() {
+  if (!navigator.xr) { bilgi.textContent = 'Bu tarayıcı WebXR desteklemiyor. Android Chrome kullan.'; return; }
+  if (!(await navigator.xr.isSessionSupported('immersive-ar'))) { bilgi.textContent = 'Bu cihazda AR desteklenmiyor.'; return; }
+
+  const temel = { requiredFeatures: ['hit-test', 'dom-overlay'], domOverlay: { root: document.body } };
+  try {
+    if (!isaretBitmap) throw new Error('işaret yok');
+    oturum = await navigator.xr.requestSession('immersive-ar', {
+      ...temel,
+      requiredFeatures: [...temel.requiredFeatures, 'image-tracking'],
+      trackedImages: [{ image: isaretBitmap, widthInMeters: ISARET_GENISLIK }]
+    });
+    isaretTakibiVar = true;
+  } catch (e) {
+    // İşaret takibi açılamadı: bayrak kapalı olabilir. Elle yerleştirmeyle devam et.
+    try {
+      oturum = await navigator.xr.requestSession('immersive-ar', temel);
+    } catch (e2) {
+      bilgi.textContent = 'AR başlatılamadı: ' + e2.message;
+      return;
+    }
+    isaretTakibiVar = false;
+    takipModu = 'elle';
+  }
+
+  await renderer.xr.setSession(oturum);
+  btnBasla.classList.add('gizli');
+  [btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.remove('gizli'));
+  btnKilitle.disabled = !isaretTakibiVar;
+
+  if (isaretTakibiVar) {
+    bilgi.textContent = 'Kamerayı basılı işarete doğrult.';
+    durum.textContent = 'İşaret aranıyor...';
+    if (oturum.getTrackedImageScores) {
+      oturum.getTrackedImageScores().then((puanlar) => {
+        if (puanlar[0] === 'untrackable') durum.textContent = 'İşaret görüntüsü takip için uygun bulunmadı.';
+      });
+    }
+  } else {
+    bilgi.textContent = 'İşaret takibi kapalı (Chrome bayrağı). Yeşil halka göründüğünde dokunarak yerleştir.';
+    durum.textContent = 'Açmak için: chrome://flags → "WebXR Incubations" → Enabled → Chrome\'u yeniden başlat.';
+  }
+
+  oturum.addEventListener('end', () => {
+    oturum = null;
+    hitTestIstendi = false; hitTestKaynagi = null;
+    if (yerlesik) { sahne.remove(model); yerlesik = false; }
+    takipModu = 'isaret';
+    isaretCerceve.visible = false; halka.visible = false;
+    btnBasla.classList.remove('gizli');
+    [btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.add('gizli'));
+    bilgi.textContent = 'AR kapatıldı. Tekrar başlatabilirsin.';
+    durum.textContent = '';
+  });
 }
 
 function modeliYukle() {
@@ -124,36 +237,44 @@ function modeliYukle() {
     yukleyici.setMaterials(malzemeler);
     yukleyici.load(MODEL_OBJ, (obj) => {
       obj.scale.setScalar(MODEL_OLCEK);
-
-      // Modeli tabanı yerde, ortası halkanın ortasında olacak şekilde kaydır
       const kutu = new THREE.Box3().setFromObject(obj);
       const merkez = kutu.getCenter(new THREE.Vector3());
-      obj.position.set(-merkez.x, -kutu.min.y, -merkez.z);
-
+      obj.position.set(-merkez.x, -kutu.min.y, -merkez.z);   // taban yerde, orta noktada
       model = new THREE.Group();
       model.add(obj);
-
       const boyut = kutu.getSize(new THREE.Vector3()).multiplyScalar(1000);
-      bilgi.textContent = `Model hazır (${boyut.x.toFixed(0)} × ${boyut.y.toFixed(0)} × ${boyut.z.toFixed(0)} mm). START AR'a bas, yeşil halka göründüğünde ekrana dokun.`;
+      bilgi.textContent = `Model hazır (${boyut.x.toFixed(0)} × ${boyut.y.toFixed(0)} × ${boyut.z.toFixed(0)} mm). AR'ı başlat ve kamerayı işarete doğrult.`;
     },
-    (ilerleme) => {
-      if (ilerleme.total) bilgi.textContent = `Model yükleniyor %${Math.round(100 * ilerleme.loaded / ilerleme.total)}`;
-    },
-    (hata) => { bilgi.textContent = 'Model yüklenemedi: ' + MODEL_OBJ + ' dosyası depoda var mı?'; });
-  },
-  undefined,
-  (hata) => { bilgi.textContent = 'Renk dosyası yüklenemedi: ' + MODEL_MTL + ' depoda var mı?'; });
+    (ilerleme) => { if (ilerleme.total) bilgi.textContent = `Model yükleniyor %${Math.round(100 * ilerleme.loaded / ilerleme.total)}`; },
+    () => { bilgi.textContent = 'Model yüklenemedi: ' + MODEL_OBJ + ' depoda var mı?'; });
+  }, undefined, () => { bilgi.textContent = 'Renk dosyası yüklenemedi: ' + MODEL_MTL + ' depoda var mı?'; });
 }
 
-function yerlestir() {
-  if (!model || !halka.visible) return;
-  halka.matrix.decompose(model.position, model.quaternion, model.scale);
+function modeliGoster() {
   if (!yerlesik) {
     sahne.add(model);
     yerlesik = true;
     btnDondur.disabled = btnKaldir.disabled = false;
   }
-  bilgi.textContent = 'Model yerleşti. Gerçek parçayla hizalamak için Döndür, taşımak için başka yere dokun.';
+}
+
+// İşaret pozundan modeli yerleştir: işaret merkezinden sayfa boyunca aşağı PARCA_OFSET kadar
+function isareteOtur(matris) {
+  matris.decompose(_poz, _don, _olc);
+  _ofset.set(0, -PARCA_OFSET, 0).applyQuaternion(_don);
+  model.position.copy(_poz).add(_ofset);
+  model.quaternion.copy(_don).multiply(DIK);
+  model.scale.set(1, 1, 1);
+  modeliGoster();
+}
+
+function elleYerlestir() {
+  if (!model || !halka.visible) return;
+  halka.matrix.decompose(model.position, model.quaternion, model.scale);
+  takipModu = 'elle';
+  btnKilitle.disabled = !isaretTakibiVar;
+  modeliGoster();
+  bilgi.textContent = 'Elle yerleştirildi. Döndür ile hizala; işarete geri dönmek için İşarete kilitle.';
 }
 
 function boyutDegisti() {
@@ -163,18 +284,16 @@ function boyutDegisti() {
 }
 
 function ciz(zaman, frame) {
-  if (frame) {
+  if (frame && oturum) {
     const referansAlani = renderer.xr.getReferenceSpace();
-    const oturum = renderer.xr.getSession();
 
+    // Yüzey halkası
     if (!hitTestIstendi) {
       oturum.requestReferenceSpace('viewer').then((bakisAlani) => {
         oturum.requestHitTestSource({ space: bakisAlani }).then((kaynak) => { hitTestKaynagi = kaynak; });
       });
-      oturum.addEventListener('end', () => { hitTestIstendi = false; hitTestKaynagi = null; });
       hitTestIstendi = true;
     }
-
     if (hitTestKaynagi) {
       const sonuclar = frame.getHitTestResults(hitTestKaynagi);
       if (sonuclar.length) {
@@ -182,6 +301,31 @@ function ciz(zaman, frame) {
         halka.matrix.fromArray(sonuclar[0].getPose(referansAlani).transform.matrix);
       } else {
         halka.visible = false;
+      }
+    }
+
+    // İşaret takibi
+    if (isaretTakibiVar && typeof frame.getImageTrackingResults === 'function') {
+      let durumMetni = 'İşaret görünmüyor';
+      for (const sonuc of frame.getImageTrackingResults()) {
+        if (sonuc.index !== 0) continue;
+        const poz = frame.getPose(sonuc.imageSpace, referansAlani);
+        if (!poz) continue;
+        if (sonuc.trackingState === 'tracked') {
+          isaretCerceve.matrix.fromArray(poz.transform.matrix);
+          isaretCerceve.visible = true;
+          if (model && takipModu === 'isaret') isareteOtur(isaretCerceve.matrix);
+          durumMetni = `İşaret görüldü (ölçülen genişlik ${(sonuc.measuredWidthInMeters * 1000).toFixed(0)} mm)`;
+        } else {
+          durumMetni = 'İşaret görüş dışında, takip sürüyor';
+        }
+      }
+      if (durumMetni !== sonIsaretDurumu) {
+        sonIsaretDurumu = durumMetni;
+        durum.textContent = durumMetni;
+        if (durumMetni.startsWith('İşaret görüldü') && takipModu === 'isaret') {
+          bilgi.textContent = 'Model işarete göre yerleşti. Küpü kağıttaki kutuya koy ve karşılaştır.';
+        }
       }
     }
   }

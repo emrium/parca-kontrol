@@ -74,7 +74,11 @@ const btnCik = document.getElementById('cik');
 
 const ISARET_GENISLIK = ISARET_GENISLIK_MM / 1000;
 const PARCA_OFSET = (PARCA_OFSET_MM / 1000) * (ISARET_GENISLIK_MM / 100); // baskı ölçeği farklıysa ofset de aynı oranda değişir
-const DIK = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2); // modelin +Y'sini işaretin normaline çevirir
+// İşaret uzayı (Chrome/ARCore): düzlem XZ, +Y kağıttan dışa (normal), +X sağa, +Z sayfada aşağı doğru.
+// Modelin +Y'si zaten normalle aynı, ek dönüş gerekmez.
+const DUZELTME_ESIGI_M = 0.012;  // yerleşik modelle yeni işaret pozu arasındaki fark bundan büyükse düzelt (12 mm)
+const DUZELTME_ESIGI_DERECE = 4; // ... ya da açı farkı bundan büyükse
+const YUMUSATMA = 0.15;          // düzeltme hızı (0-1, 1 = anında)
 
 let kamera, sahne, renderer, kontrolcu, halka, isaretCerceve;
 let model = null;
@@ -82,6 +86,7 @@ let yerlesik = false;
 let takipModu = 'isaret';        // 'isaret': işareti izle, 'elle': dokunarak yerleştirildi
 let isaretTakibiVar = false;
 let sonIsaretDurumu = '';
+let yenidenOtur = false;         // İşarete kilitle'ye basılınca bir sonraki görüşte anında yerleş
 let hitTestKaynagi = null;
 let hitTestIstendi = false;
 let isaretBitmap = null;
@@ -129,11 +134,15 @@ function baslat() {
   const y = ISARET_GENISLIK / 2;
   isaretCerceve = new THREE.LineLoop(
     new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(-y, -y, 0), new THREE.Vector3(y, -y, 0),
-      new THREE.Vector3(y, y, 0), new THREE.Vector3(-y, y, 0)
+      new THREE.Vector3(-y, 0, -y), new THREE.Vector3(y, 0, -y),
+      new THREE.Vector3(y, 0, y), new THREE.Vector3(-y, 0, y)
     ]),
     new THREE.LineBasicMaterial({ color: 0x2ecc71 })
   );
+  // Kırmızı nokta: işaretin alt kenar ortası (+Z). Kağıtta küp kutusuna bakan kenarda görünmeli.
+  const altNokta = new THREE.Mesh(new THREE.SphereGeometry(0.005, 12, 8), new THREE.MeshBasicMaterial({ color: 0xff3b30 }));
+  altNokta.position.set(0, 0, y);
+  isaretCerceve.add(altNokta);
   isaretCerceve.matrixAutoUpdate = false;
   isaretCerceve.visible = false;
   sahne.add(isaretCerceve);
@@ -142,6 +151,7 @@ function baslat() {
   btnCik.addEventListener('click', () => { if (oturum) oturum.end(); });
   btnKilitle.addEventListener('click', () => {
     takipModu = 'isaret';
+    yenidenOtur = true;
     btnKilitle.disabled = true;
     bilgi.textContent = 'İşarete kilitlendi. Kamerayı işarete doğrult.';
   });
@@ -202,7 +212,7 @@ async function arBaslat() {
   await renderer.xr.setSession(oturum);
   btnBasla.classList.add('gizli');
   [btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.remove('gizli'));
-  btnKilitle.disabled = !isaretTakibiVar;
+  btnKilitle.disabled = true;   // zaten işaret modunda; elle yerleştirince açılır
 
   if (isaretTakibiVar) {
     bilgi.textContent = 'Kamerayı basılı işarete doğrult.';
@@ -258,12 +268,26 @@ function modeliGoster() {
   }
 }
 
-// İşaret pozundan modeli yerleştir: işaret merkezinden sayfa boyunca aşağı PARCA_OFSET kadar
+// İşaret pozundan modeli yerleştir: işaret merkezinden sayfa boyunca aşağı (+Z) PARCA_OFSET kadar
 function isareteOtur(matris) {
   matris.decompose(_poz, _don, _olc);
-  _ofset.set(0, -PARCA_OFSET, 0).applyQuaternion(_don);
-  model.position.copy(_poz).add(_ofset);
-  model.quaternion.copy(_don).multiply(DIK);
+  _ofset.set(0, 0, PARCA_OFSET).applyQuaternion(_don);   // sayfada aşağı = +Z
+  _poz.add(_ofset);
+  if (!yerlesik || yenidenOtur) {
+    // İlk görüşte (ya da istek üzerine) anında yerleş
+    model.position.copy(_poz);
+    model.quaternion.copy(_don);
+    yenidenOtur = false;
+  } else {
+    // Yerleşik model sabit kalır; işaret pozu belirgin sapma gösterirse yumuşak düzelt.
+    // Böylece küçük ölçüm titremeleri modele yansımaz.
+    const konumFarki = model.position.distanceTo(_poz);
+    const aciFarki = THREE.MathUtils.radToDeg(model.quaternion.angleTo(_don));
+    if (konumFarki > DUZELTME_ESIGI_M || aciFarki > DUZELTME_ESIGI_DERECE) {
+      model.position.lerp(_poz, YUMUSATMA);
+      model.quaternion.slerp(_don, YUMUSATMA);
+    }
+  }
   model.scale.set(1, 1, 1);
   modeliGoster();
 }

@@ -36,6 +36,8 @@
   #arac button:disabled { opacity: .4; }
   #basla { background: #2ecc71; font-weight: 600; }
   #kontrol { background: #ffd54a; font-weight: 600; }
+  #canli.acik { background: #ffd54a; font-weight: 600; }
+  #ogret { background: #9ad0ff; }
   .gizli { display: none !important; }
 </style>
 </head>
@@ -47,6 +49,9 @@
 <div id="arac">
   <button id="basla">AR'ı başlat</button>
   <button id="kontrol" class="gizli" disabled>Kontrol et</button>
+  <button id="canli" class="gizli" disabled>Canlı</button>
+  <button id="ogret" class="gizli" disabled>Öğret</button>
+  <button id="ogretSil" class="gizli">Öğretimi sil</button>
   <button id="kilitle" class="gizli" disabled>İşarete kilitle</button>
   <button id="dondur" class="gizli" disabled>Döndür 15°</button>
   <button id="kaldir" class="gizli" disabled>Kaldır</button>
@@ -118,6 +123,12 @@ const RENKLER = {
 };
 const MIN_DOYGUNLUK = 0.22;       // renkli etiket için en az doygunluk (siyah bant/boşluk bunun altında kalır)
 const MIN_PARLAKLIK = 0.18;
+// Öğretilmiş referansla karşılaştırma (Öğret düğmesiyle sağlam parçadan alınan renkler)
+const KROMA_ESIGI = 0.08;         // renk oranlarında (r,g)/(r+g+b) izin verilen fark; ışık şiddetinden bağımsız
+const PARLAKLIK_ORAN_MIN = 0.55;  // örneğin parlaklığı referansın en az %55'i olmalı (siyah bant/boşluk bunun altına düşer)
+const PARLAKLIK_ORAN_MAKS = 1.8;
+const CANLI_KARE_ARALIGI = 6;     // canlı modda her kaçıncı karede kontrol yapılır (~10 Hz)
+const CANLI_HATA_KARARLILIGI = 2; // canlı modda bir bölgenin kırmızıya dönmesi için art arda kaç kontrolde hatalı çıkmalı
 // ----------------------------------------------------------------------
 
 const bilgi = document.getElementById('bilgi');
@@ -127,6 +138,9 @@ const hataAyik = document.getElementById('hataAyik');
 const arac = document.getElementById('arac');
 const btnBasla = document.getElementById('basla');
 const btnKontrol = document.getElementById('kontrol');
+const btnCanli = document.getElementById('canli');
+const btnOgret = document.getElementById('ogret');
+const btnOgretSil = document.getElementById('ogretSil');
 const btnKilitle = document.getElementById('kilitle');
 const btnDondur = document.getElementById('dondur');
 const btnKaldir = document.getElementById('kaldir');
@@ -159,6 +173,13 @@ let sonIpucuZamani = 0;
 let zeminY = [];                 // kilit sırasında yüzey halkasından okunan masa yükseklikleri
 
 let kontrolIstendi = false;
+let ogretIstendi = false;
+let canli = false;
+let kareSayaci = 0;
+let hataSayaci = [];             // canlı modda bölge başına art arda hata sayısı
+let ogretilen = {};              // { bölge adı: [ [r,g,b], ... ] } sağlam parçadan alınan referans renkler
+const OGRET_ANAHTAR = 'ogret:' + MODEL_OBJ;
+try { ogretilen = JSON.parse(localStorage.getItem(OGRET_ANAHTAR) || '{}'); } catch (e) { ogretilen = {}; }
 let glBinding = null;
 let yakalayici = null;           // kamera görüntüsünü küçük tampona çeken WebGL yardımcı nesneleri
 
@@ -217,6 +238,21 @@ function baslat() {
   btnBasla.addEventListener('click', arBaslat);
   btnCik.addEventListener('click', () => { if (oturum) oturum.end(); });
   btnKontrol.addEventListener('click', () => { kontrolIstendi = true; sonucKutu.textContent = 'Kontrol ediliyor...'; });
+  btnCanli.addEventListener('click', () => {
+    canli = !canli;
+    btnCanli.classList.toggle('acik', canli);
+    btnCanli.textContent = canli ? 'Canlı: açık' : 'Canlı';
+    hataSayaci = [];
+    if (!canli) sonucKutu.textContent = '';
+  });
+  btnOgret.addEventListener('click', () => { ogretIstendi = true; sonucKutu.textContent = 'Öğreniyor...'; });
+  btnOgretSil.addEventListener('click', () => {
+    ogretilen = {};
+    localStorage.removeItem(OGRET_ANAHTAR);
+    ogretDurumu();
+    sonucKutu.textContent = 'Öğretilen renkler silindi; kontrol CAD renkleriyle yapılır.';
+  });
+  ogretDurumu();
   btnKilitle.addEventListener('click', () => {
     takipModu = 'isaret';
     kilidiAc();
@@ -229,7 +265,7 @@ function baslat() {
       sahne.remove(model);
       yerlesik = false;
       takipModu = 'elle';
-      btnDondur.disabled = btnKaldir.disabled = btnKontrol.disabled = true;
+      btnDondur.disabled = btnKaldir.disabled = btnKontrol.disabled = btnCanli.disabled = btnOgret.disabled = true;
       btnKilitle.disabled = false;
       bilgi.textContent = 'Model kaldırıldı. Halkaya dokun ya da İşarete kilitle.';
     }
@@ -282,9 +318,9 @@ async function arBaslat() {
   await renderer.xr.setSession(oturum);
   glBinding = null; yakalayici = null;
   btnBasla.classList.add('gizli');
-  [btnKontrol, btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.remove('gizli'));
+  [btnKontrol, btnCanli, btnOgret, btnOgretSil, btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.remove('gizli'));
   btnKilitle.disabled = true;
-  btnKontrol.disabled = !yerlesik;
+  btnKontrol.disabled = btnCanli.disabled = btnOgret.disabled = !yerlesik;
 
   if (isaretTakibiVar) {
     bilgi.textContent = 'Kamerayı basılı işarete doğrult.';
@@ -309,7 +345,8 @@ async function arBaslat() {
     isaretCerceve.visible = false; halka.visible = false;
     hataAyik.style.display = 'none';
     btnBasla.classList.remove('gizli');
-    [btnKontrol, btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.add('gizli'));
+    [btnKontrol, btnCanli, btnOgret, btnOgretSil, btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.add('gizli'));
+    canli = false; btnCanli.classList.remove('acik'); btnCanli.textContent = 'Canlı';
     bilgi.textContent = 'AR kapatıldı. Tekrar başlatabilirsin.';
     durum.textContent = ''; sonucKutu.textContent = '';
   });
@@ -355,7 +392,7 @@ function modeliGoster() {
   if (!yerlesik) {
     sahne.add(model);
     yerlesik = true;
-    btnDondur.disabled = btnKaldir.disabled = btnKontrol.disabled = false;
+    btnDondur.disabled = btnKaldir.disabled = btnKontrol.disabled = btnCanli.disabled = btnOgret.disabled = false;
   }
 }
 
@@ -603,47 +640,38 @@ function renkKarari(hsv, beklenen) {
   return fark <= k.tol ? { tamam: true } : { tamam: false, neden: `farklı renk (ton ${hsv.h.toFixed(0)}°)` };
 }
 
-function kontrolYap(frame, referansAlani) {
+// Kamera karesini yakalar ve her bölgenin görünürlüğünü + ortalama rengini ölçer.
+// Karar vermez; kontrol ve öğret bunu kullanır. Hata varsa {hata: mesaj} döner.
+function bolgeleriOlc(frame, referansAlani) {
   const gorus = frame.getViewerPose(referansAlani);
-  if (!gorus) { sonucKutu.textContent = 'Kamera pozu alınamadı, tekrar dene.'; return; }
+  if (!gorus) return { hata: 'Kamera pozu alınamadı, tekrar dene.' };
   const view = gorus.views[0];
-  if (!view.camera) {
-    sonucKutu.innerHTML = '<span class="eksik">Kamera görüntüsüne erişim yok.</span> chrome://flags → "WebXR Incubations" Enabled mı? Chrome\'u yeniden başlatıp dene.';
-    return;
-  }
+  if (!view.camera) return { hata: '<span class="eksik">Kamera görüntüsüne erişim yok.</span> chrome://flags → "WebXR Incubations" Enabled mı? Chrome\'u yeniden başlatıp dene.' };
   const gl = renderer.getContext();
   if (!glBinding) glBinding = new XRWebGLBinding(oturum, gl);
   const doku = glBinding.getCameraImage(view.camera);
-  if (!doku) { sonucKutu.textContent = 'Bu karede kamera görüntüsü yok, tekrar dene.'; return; }
+  if (!doku) return { hata: 'Bu karede kamera görüntüsü yok, tekrar dene.' };
   if (!yakalayici) yakalayici = yakalayiciKur(gl, 320, Math.max(4, Math.round(320 * view.camera.height / view.camera.width)));
   kareYakala(gl, doku);
   const { W, H, piksel } = yakalayici;
 
-  // Dünya → görüntü: projeksiyon * kamera dönüşümünün tersi
   const PV = new THREE.Matrix4().fromArray(view.projectionMatrix).multiply(new THREE.Matrix4().fromArray(view.transform.inverse.matrix));
   const kameraKonum = new THREE.Vector3(view.transform.position.x, view.transform.position.y, view.transform.position.z);
   model.updateMatrixWorld(true);
 
   const dunya = new THREE.Vector3(), normalD = new THREE.Vector3(), bakis = new THREE.Vector3(), teget = new THREE.Vector3(), kenar = new THREE.Vector3(), ndc = new THREE.Vector3();
-  const noktalar = [];
-  let tamamSay = 0, eksikler = [], gorunmez = 0;
-  BOLGELER.forEach((b, i) => {
+  const olcumler = BOLGELER.map((b) => {
     dunya.set(b.konum[0] / 1000, b.konum[1] / 1000, b.konum[2] / 1000);
     model.localToWorld(dunya);
     normalD.set(...b.normal).applyQuaternion(model.quaternion);
     bakis.copy(kameraKonum).sub(dunya).normalize();
-    const isaret = bolgeIsaretleri[i];
-    if (normalD.dot(bakis) < 0.30) { gorunmez++; isaret.material.color.set(0x9e9e9e); return; }   // yüz kameraya bakmıyor
-
+    if (normalD.dot(bakis) < 0.30) return { gorunur: false };
     ndc.copy(dunya).applyMatrix4(PV);
-    if (Math.abs(ndc.x) > 0.98 || Math.abs(ndc.y) > 0.98 || ndc.z > 1) { gorunmez++; isaret.material.color.set(0x9e9e9e); return; }
-    const px = (ndc.x + 1) / 2 * W, py = (ndc.y + 1) / 2 * H;   // py alttan yukarı
-
-    // örnekleme yarıçapı: bölge yarıçapının görüntüdeki karşılığı
+    if (Math.abs(ndc.x) > 0.98 || Math.abs(ndc.y) > 0.98 || ndc.z > 1) return { gorunur: false };
+    const px = (ndc.x + 1) / 2 * W, py = (ndc.y + 1) / 2 * H;
     teget.crossVectors(normalD, Math.abs(normalD.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0)).normalize();
     kenar.copy(dunya).addScaledVector(teget, BOLGE_YARICAP_MM / 1000).applyMatrix4(PV);
     const r = Math.min(14, Math.max(2, Math.hypot((kenar.x - ndc.x) / 2 * W, (kenar.y - ndc.y) / 2 * H)));
-
     let R = 0, G = 0, B = 0, n = 0;
     for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
       if (dx * dx + dy * dy > r * r) continue;
@@ -652,20 +680,86 @@ function kontrolYap(frame, referansAlani) {
       const k = (yy * W + x) * 4;
       R += piksel[k]; G += piksel[k + 1]; B += piksel[k + 2]; n++;
     }
-    if (!n) { gorunmez++; isaret.material.color.set(0x9e9e9e); return; }
-    const hsv = rgbToHsv(R / n, G / n, B / n);
-    const karar = renkKarari(hsv, b.renk);
-    if (karar.tamam) { tamamSay++; isaret.material.color.set(0x2ecc71); }
-    else { eksikler.push(`${b.ad}: ${karar.neden}`); isaret.material.color.set(0xff3b30); }
-    noktalar.push({ px, py, r, tamam: karar.tamam, rgb: [R / n, G / n, B / n] });
+    if (!n) return { gorunur: false };
+    return { gorunur: true, px, py, r, rgb: [R / n, G / n, B / n] };
   });
+  return { olcumler, W, H, piksel };
+}
 
+// Öğretilmiş referansla karşılaştırma: renk oranları (ışık şiddetinden bağımsız) + parlaklık oranı
+function ogretilenKarar(rgb, referanslar) {
+  const kroma = (c) => { const t = c[0] + c[1] + c[2] + 1e-6; return [c[0] / t, c[1] / t, (c[0] + c[1] + c[2]) / 3]; };
+  const [r1, g1, v1] = kroma(rgb);
+  let enIyi = Infinity, oran = 1;
+  for (const ref of referanslar) {
+    const [r2, g2, v2] = kroma(ref);
+    const d = Math.hypot(r1 - r2, g1 - g2);
+    if (d < enIyi) { enIyi = d; oran = v1 / (v2 + 1e-6); }
+  }
+  if (oran < PARLAKLIK_ORAN_MIN) return { tamam: false, neden: 'karanlık/boş' };
+  if (oran > PARLAKLIK_ORAN_MAKS) return { tamam: false, neden: 'çok parlak/yansıma' };
+  if (enIyi > KROMA_ESIGI) return { tamam: false, neden: 'farklı renk' };
+  return { tamam: true };
+}
+
+function bolgeKarari(b, rgb) {
+  const ref = ogretilen[b.ad];
+  if (ref && ref.length) return ogretilenKarar(rgb, ref);
+  return renkKarari(rgbToHsv(rgb[0], rgb[1], rgb[2]), b.renk);   // öğretilmemişse CAD rengi kuralı
+}
+
+function kontrolYap(frame, referansAlani, canliMod) {
+  const sonuc = bolgeleriOlc(frame, referansAlani);
+  if (sonuc.hata) { sonucKutu.innerHTML = sonuc.hata; return; }
+  const { olcumler, W, H, piksel } = sonuc;
+  const noktalar = [];
+  let tamamSay = 0, eksikler = [], gorunmez = 0;
+  olcumler.forEach((o, i) => {
+    const isaret = bolgeIsaretleri[i];
+    if (!o.gorunur) { gorunmez++; isaret.material.color.set(0x9e9e9e); hataSayaci[i] = 0; return; }
+    const karar = bolgeKarari(BOLGELER[i], o.rgb);
+    let hatali = !karar.tamam;
+    if (canliMod) {   // canlıda tek karelik titremeleri ele: art arda hata gerekir
+      hataSayaci[i] = hatali ? (hataSayaci[i] || 0) + 1 : 0;
+      hatali = hataSayaci[i] >= CANLI_HATA_KARARLILIGI;
+    }
+    if (!hatali) { tamamSay++; isaret.material.color.set(0x2ecc71); }
+    else { eksikler.push(`${BOLGELER[i].ad}: ${karar.neden}`); isaret.material.color.set(0xff3b30); }
+    noktalar.push({ px: o.px, py: o.py, r: o.r, tamam: !hatali });
+  });
   const kontrolEdilen = BOLGELER.length - gorunmez;
   let html = `<span class="${eksikler.length ? 'eksik' : 'tamam'}">${tamamSay}/${kontrolEdilen} bölge tamam</span>`;
-  if (gorunmez) html += ` · ${gorunmez} bölge görüş dışında`;
+  if (gorunmez) html += ` · ${gorunmez} görüş dışında`;
+  if (Object.keys(ogretilen).length) html += ' · öğretilmiş referans';
   if (eksikler.length) html += '<br>' + eksikler.map(e => `<span class="eksik">✗ ${e}</span>`).join('<br>');
   sonucKutu.innerHTML = html;
-  hataAyiklamaCiz(W, H, piksel, noktalar);
+  if (!canliMod || kareSayaci % 30 === 0) hataAyiklamaCiz(W, H, piksel, noktalar);
+}
+
+// Sağlam parçadan referans al: görünen her bölgenin o anki rengi listeye eklenir.
+// Farklı açılardan birkaç kez basmak referansı zenginleştirir.
+function ogret(frame, referansAlani) {
+  const sonuc = bolgeleriOlc(frame, referansAlani);
+  if (sonuc.hata) { sonucKutu.innerHTML = sonuc.hata; return; }
+  let eklenen = 0;
+  sonuc.olcumler.forEach((o, i) => {
+    if (!o.gorunur) return;
+    const ad = BOLGELER[i].ad;
+    (ogretilen[ad] = ogretilen[ad] || []).push(o.rgb.map(Math.round));
+    if (ogretilen[ad].length > 12) ogretilen[ad].shift();
+    bolgeIsaretleri[i].material.color.set(0x9ad0ff);
+    eklenen++;
+  });
+  try { localStorage.setItem(OGRET_ANAHTAR, JSON.stringify(ogretilen)); } catch (e) {}
+  ogretDurumu();
+  sonucKutu.innerHTML = `${eklenen} bölgenin rengi öğrenildi. Küpü farklı bir açıdan görüp tekrar basabilirsin.`;
+  hataAyiklamaCiz(sonuc.W, sonuc.H, sonuc.piksel, sonuc.olcumler.filter(o => o.gorunur).map(o => ({ ...o, tamam: true })));
+}
+
+function ogretDurumu() {
+  const n = Object.keys(ogretilen).length;
+  btnOgret.textContent = n ? `Öğret (${n}/${BOLGELER.length})` : 'Öğret';
+  btnOgretSil.style.display = n ? '' : 'none';
 }
 
 // Sağ altta: yakalanan kamera karesi ve örneklenen noktalar (projeksiyon doğru mu diye)
@@ -674,7 +768,7 @@ function hataAyiklamaCiz(W, H, piksel, noktalar) {
   const ara = document.createElement('canvas'); ara.width = W; ara.height = H;
   const ctx = ara.getContext('2d');
   const img = ctx.createImageData(W, H);
-  for (let y = 0; y < H; y++) {           // GL tamponu alttan üste; canvas üstten aşağı
+  for (let y = 0; y < H; y++) {
     img.data.set(piksel.subarray((H - 1 - y) * W * 4, (H - y) * W * 4), y * W * 4);
   }
   ctx.putImageData(img, 0, 0);
@@ -747,11 +841,14 @@ function ciz(zaman, frame) {
 
     // Kontrol, çizimden SONRA yapılır: kamera dokusu bu kare boyunca geçerli, sonrasında resetState ile
     // Three.js durumu sıfırlanır ve bir sonraki karede yeniden kurulur.
-    if (kontrolIstendi && yerlesik) {
-      kontrolIstendi = false;
-      try { kontrolYap(frame, referansAlani); }
-      catch (e) { sonucKutu.textContent = 'Kontrol hatası: ' + e.message; renderer.resetState(); }
-    }
+    kareSayaci++;
+    if (yerlesik) {
+      try {
+        if (ogretIstendi) { ogretIstendi = false; ogret(frame, referansAlani); }
+        else if (kontrolIstendi) { kontrolIstendi = false; kontrolYap(frame, referansAlani, false); }
+        else if (canli && kilitli && kareSayaci % CANLI_KARE_ARALIGI === 0) kontrolYap(frame, referansAlani, true);
+      } catch (e) { sonucKutu.textContent = 'Kontrol hatası: ' + e.message; renderer.resetState(); }
+    } else { kontrolIstendi = ogretIstendi = false; }
     return;
   }
   renderer.render(sahne, kamera);

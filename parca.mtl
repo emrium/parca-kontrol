@@ -1,0 +1,49 @@
+# Puzzle küp malzemeleri
+newmtl siyah
+Ka 0 0 0
+Kd 0.040 0.040 0.040
+Ks 0.15 0.15 0.15
+Ns 40
+illum 2
+
+newmtl beyaz
+Ka 0 0 0
+Kd 0.950 0.950 0.950
+Ks 0.15 0.15 0.15
+Ns 40
+illum 2
+
+newmtl sari
+Ka 0 0 0
+Kd 1.000 0.840 0.000
+Ks 0.15 0.15 0.15
+Ns 40
+illum 2
+
+newmtl yesil
+Ka 0 0 0
+Kd 0.000 0.620 0.280
+Ks 0.15 0.15 0.15
+Ns 40
+illum 2
+
+newmtl mavi
+Ka 0 0 0
+Kd 0.000 0.300 0.720
+Ks 0.15 0.15 0.15
+Ns 40
+illum 2
+
+newmtl kirmizi
+Ka 0 0 0
+Kd 0.800 0.020 0.060
+Ks 0.15 0.15 0.15
+Ns 40
+illum 2
+
+newmtl turuncu
+Ka 0 0 0
+Kd 1.000 0.380 0.000
+Ks 0.15 0.15 0.15
+Ns 40
+illum 2

@@ -81,6 +81,13 @@ const YENIDEN_KILIT_M = 0.03;     // işaret, kilitli konumdan bu kadar (30 mm) 
 const YENIDEN_KILIT_KARE = 45;    // ... ve bu sapma en az bu kadar kare art arda sürmeli
 const ISARET_YATAY = true;        // işaret yatay bir masada duruyor: normali yukarı bakmayan ölçümler elenir
 const MAKS_EGIM_DERECE = 20;      // işaret normali ile "yukarı" arasındaki izin verilen en büyük açı
+// Ölçüm kalite süzgeci: kilit yalnızca iyi görüş koşullarında alınan ölçümlerle yapılır
+const MAKS_MESAFE_M = 0.60;       // kamera-işaret uzaklığı en fazla 60 cm
+const MAKS_BAKIS_ACISI = 35;      // işaret normali ile bakış doğrultusu arası en fazla 35° (tepeden bakış = 0°)
+const MERKEZ_SINIRI = 0.6;        // işaret merkezi görüntünün orta %60'lık alanında olmalı (-0.6..0.6)
+const TUTARLILIK_MM = 4;          // 40 ölçümün konumları ortancadan en fazla bu kadar sapmalı
+const TUTARLILIK_ORAN = 0.8;      // ölçümlerin en az %80'i yönelim olarak birbiriyle uyumlu olmalı
+const MAKS_BEKLEME_KARE = 300;    // ~5 s içinde tutarlılık sağlanamazsa eldeki en iyi ölçümle kilitle
 
 // ---- Kontrol bölgeleri -----------------------------------------------
 // Koordinatlar model uzayında, mm; orijin modelin TABAN MERKEZİ (uygulama modeli böyle yerleştirir).
@@ -147,6 +154,8 @@ let capaIsteniyor = false;
 let sabitMatris = null;
 let sapmaKare = 0;
 let elenenOrnek = 0;
+let beklemeKare = 0;
+let sonIpucuZamani = 0;
 
 let kontrolIstendi = false;
 let glBinding = null;
@@ -374,9 +383,27 @@ function isaretGoruldu(poz, frame, referansAlani) {
         return;
       }
     }
+    // Görüş kalitesi: uzaklık, bakış açısı ve görüntüde merkeze yakınlık
+    const ipucu = gorusKalitesi(t, frame, referansAlani);
+    beklemeKare++;
+    if (ipucu) {
+      if (performance.now() - sonIpucuZamani > 400) { durum.textContent = ipucu; sonIpucuZamani = performance.now(); }
+      return;
+    }
     ornekler.push({ p: [t.position.x, t.position.y, t.position.z], q: [t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w] });
+    if (ornekler.length > ORNEK_SAYISI) ornekler.shift();   // kayan pencere: en yeni 40 iyi ölçüm
     durum.textContent = `İşaret ölçülüyor ${ornekler.length}/${ORNEK_SAYISI} — telefonu sabit tut`;
-    if (ornekler.length >= ORNEK_SAYISI) kilitle(ortalamaPoz(ornekler), frame, referansAlani);
+    if (ornekler.length >= ORNEK_SAYISI) {
+      const poz = ortalamaPoz(ornekler);
+      const tutarli = poz.kullanilan >= TUTARLILIK_ORAN * ORNEK_SAYISI && poz.yayilimMM <= TUTARLILIK_MM;
+      if (tutarli || beklemeKare > MAKS_BEKLEME_KARE) {
+        kilitle(poz, frame, referansAlani);
+        if (!tutarli) durum.textContent = `Kilitlendi ama ölçümler dağınıktı (±${poz.yayilimMM.toFixed(0)} mm). Gerekirse İşarete kilitle ile yenile.`;
+      } else if (performance.now() - sonIpucuZamani > 400) {
+        durum.textContent = `Ölçümler tutarsız (±${poz.yayilimMM.toFixed(0)} mm) — telefonu sabit tut`;
+        sonIpucuZamani = performance.now();
+      }
+    }
     return;
   }
   const kilitliPoz = capa ? frame.getPose(capa.anchorSpace, referansAlani) : null;
@@ -389,6 +416,26 @@ function isaretGoruldu(poz, frame, referansAlani) {
       bilgi.textContent = 'İşaret yer değiştirmiş görünüyor, yeniden ölçülüyor. Telefonu sabit tut.';
     }
   }
+}
+
+// İşaretin o karede yeterince iyi görüldüğünü denetler; sorun varsa kullanıcıya ipucu döndürür, yoksa ''.
+function gorusKalitesi(t, frame, referansAlani) {
+  const gorus = frame.getViewerPose(referansAlani);
+  if (!gorus) return 'Kamera pozu yok';
+  const view = gorus.views[0];
+  const kam = view.transform.position;
+  const dx = kam.x - t.position.x, dy = kam.y - t.position.y, dz = kam.z - t.position.z;
+  const mesafe = Math.hypot(dx, dy, dz);
+  if (mesafe > MAKS_MESAFE_M) return `İşarete yaklaş (${(mesafe * 100).toFixed(0)} cm, en fazla ${(MAKS_MESAFE_M * 100).toFixed(0)} cm)`;
+  _don.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+  const normal = _poz.set(0, 1, 0).applyQuaternion(_don);
+  const cosAci = (normal.x * dx + normal.y * dy + normal.z * dz) / mesafe;
+  const aci = THREE.MathUtils.radToDeg(Math.acos(THREE.MathUtils.clamp(cosAci, -1, 1)));
+  if (aci > MAKS_BAKIS_ACISI) return `İşarete daha dik bak (${aci.toFixed(0)}°, en fazla ${MAKS_BAKIS_ACISI}°)`;
+  _mat.fromArray(view.projectionMatrix).multiply(new THREE.Matrix4().fromArray(view.transform.inverse.matrix));
+  const ndc = _ofset.set(t.position.x, t.position.y, t.position.z).applyMatrix4(_mat);
+  if (Math.abs(ndc.x) > MERKEZ_SINIRI || Math.abs(ndc.y) > MERKEZ_SINIRI) return 'İşareti ekranın ortasına al';
+  return '';
 }
 
 // Dayanıklı ortalama: önce diğerlerine en çok benzeyen yönelimi (medoid) bul, ona 4°'den yakın
@@ -412,7 +459,8 @@ function ortalamaPoz(ornekler) {
     for (let i = 0; i < 4; i++) q[i] += isaret * o.q[i];
   }
   const n = Math.hypot(...q);
-  return { position: { x: p[0], y: p[1], z: p[2], w: 1 }, orientation: { x: q[0]/n, y: q[1]/n, z: q[2]/n, w: q[3]/n }, kullanilan: icerde.length };
+  const yayilimMM = Math.max(...icerde.map(o => Math.hypot(o.p[0] - p[0], o.p[1] - p[1], o.p[2] - p[2]))) * 1000;
+  return { position: { x: p[0], y: p[1], z: p[2], w: 1 }, orientation: { x: q[0]/n, y: q[1]/n, z: q[2]/n, w: q[3]/n }, kullanilan: icerde.length, yayilimMM };
 }
 
 function kilitle(poz, frame, referansAlani) {
@@ -438,7 +486,7 @@ function kilitle(poz, frame, referansAlani) {
 function kilidiAc() {
   if (capa && typeof capa.delete === 'function') { try { capa.delete(); } catch (e) {} }
   capa = null; sabitMatris = null; kilitli = false; capaIsteniyor = false;
-  ornekler = []; sapmaKare = 0; elenenOrnek = 0;
+  ornekler = []; sapmaKare = 0; elenenOrnek = 0; beklemeKare = 0;
 }
 
 function elleYerlestir() {

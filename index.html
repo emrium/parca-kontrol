@@ -3,36 +3,50 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Parça Kontrol – İşaretle Hizalama</title>
+<title>Parça Kontrol – Eksik Parça Kontrolü</title>
 <style>
   body { margin: 0; background: #1c1f24; color: #e8e8e8; font-family: system-ui, sans-serif; }
   #bilgi {
     position: absolute; top: 0; left: 0; right: 0;
-    padding: 14px 16px; font-size: 15px; line-height: 1.4; text-align: center;
+    padding: 12px 16px; font-size: 14px; line-height: 1.4; text-align: center;
     text-shadow: 0 1px 3px rgba(0,0,0,.8);
   }
   #durum {
-    position: absolute; top: 96px; left: 0; right: 0; text-align: center;
+    position: absolute; top: 84px; left: 0; right: 0; text-align: center;
     font-size: 13px; text-shadow: 0 1px 3px rgba(0,0,0,.8);
+  }
+  #sonuc {
+    position: absolute; top: 110px; left: 12px; right: 12px;
+    font-size: 14px; line-height: 1.5; text-shadow: 0 1px 3px rgba(0,0,0,.8);
+  }
+  #sonuc .tamam { color: #7CFC9A; }
+  #sonuc .eksik { color: #FF7B72; font-weight: 600; }
+  #hataAyik {
+    position: absolute; right: 8px; bottom: 96px; width: 160px; height: 120px;
+    border: 1px solid rgba(255,255,255,.6); background: #000; display: none;
   }
   #arac {
     position: absolute; bottom: 24px; left: 0; right: 0;
-    display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; padding: 0 12px;
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; padding: 0 12px;
   }
   #arac button {
-    padding: 12px 18px; font-size: 15px; border: 0; border-radius: 8px;
+    padding: 11px 16px; font-size: 14px; border: 0; border-radius: 8px;
     background: rgba(255,255,255,.9); color: #1c1f24;
   }
   #arac button:disabled { opacity: .4; }
   #basla { background: #2ecc71; font-weight: 600; }
+  #kontrol { background: #ffd54a; font-weight: 600; }
   .gizli { display: none !important; }
 </style>
 </head>
 <body>
 <div id="bilgi">Model yükleniyor...</div>
 <div id="durum"></div>
+<div id="sonuc"></div>
+<canvas id="hataAyik" width="160" height="120"></canvas>
 <div id="arac">
   <button id="basla">AR'ı başlat</button>
+  <button id="kontrol" class="gizli" disabled>Kontrol et</button>
   <button id="kilitle" class="gizli" disabled>İşarete kilitle</button>
   <button id="dondur" class="gizli" disabled>Döndür 15°</button>
   <button id="kaldir" class="gizli" disabled>Kaldır</button>
@@ -61,44 +75,82 @@ const MODEL_OLCEK = 0.001;        // model mm ise 0.001 (Three.js metre kullanı
 const ISARET_DOSYA = 'isaret.png';
 const ISARET_GENISLIK_MM = 100;   // kağıttaki işaretin cetvelle ölçülen dış genişliği
 const PARCA_OFSET_MM = 100;       // işaret merkezinden parça yerinin merkezine, sayfada aşağı doğru (%100 baskıda)
+
+const ORNEK_SAYISI = 40;          // kilitlemeden önce işaret pozunun kaç kare ortalaması alınacak (~0,7 s)
+const YENIDEN_KILIT_M = 0.03;     // işaret, kilitli konumdan bu kadar (30 mm) uzakta görülürse kağıt oynamış say
+const YENIDEN_KILIT_KARE = 45;    // ... ve bu sapma en az bu kadar kare art arda sürmeli
+
+// ---- Kontrol bölgeleri -----------------------------------------------
+// Koordinatlar model uzayında, mm; orijin modelin TABAN MERKEZİ (uygulama modeli böyle yerleştirir).
+// Her bölge: ad, merkez konumu, yüzey normali (kameraya bakıyor mu diye), beklenen renk.
+// Gerçek parçada bu liste CAD'den üretilecek; küp için 3 görünür yüzün 9'ar etiketi.
+const BOLGE_YARICAP_MM = 5;       // her bölgede örneklenen dairenin yarıçapı (etiket 15,6 mm)
+const P = 55 / 3;
+const BOLGELER = [];
+{
+  let n = 0;
+  for (const k of [-1, 0, 1]) for (const i of [-1, 0, 1])   // üst yüz (+Y): beyaz
+    BOLGELER.push({ ad: `üst ${++n}`, konum: [i * P, 55, k * P], normal: [0, 1, 0], renk: 'beyaz' });
+  n = 0;
+  for (const j of [1, 0, -1]) for (const i of [-1, 0, 1])   // ön yüz (+Z, alt kenara bakan): yeşil
+    BOLGELER.push({ ad: `ön ${++n}`, konum: [i * P, 27.5 + j * P, 27.5], normal: [0, 0, 1], renk: 'yesil' });
+  n = 0;
+  for (const j of [1, 0, -1]) for (const k of [1, 0, -1])   // sağ yüz (+X): kırmızı
+    BOLGELER.push({ ad: `sağ ${++n}`, konum: [27.5, 27.5 + j * P, k * P], normal: [1, 0, 0], renk: 'kirmizi' });
+}
+// Renk kararı: nötr renkler doygunluk/parlaklıkla, diğerleri ton açısıyla (0-360) değerlendirilir
+const RENKLER = {
+  beyaz:   { notr: true, minV: 0.40, maxS: 0.40 },
+  sari:    { ton: 55,  tol: 22 },
+  turuncu: { ton: 25,  tol: 14 },
+  kirmizi: { ton: 0,   tol: 16 },
+  yesil:   { ton: 130, tol: 40 },
+  mavi:    { ton: 220, tol: 40 },
+};
+const MIN_DOYGUNLUK = 0.22;       // renkli etiket için en az doygunluk (siyah bant/boşluk bunun altında kalır)
+const MIN_PARLAKLIK = 0.18;
 // ----------------------------------------------------------------------
 
 const bilgi = document.getElementById('bilgi');
 const durum = document.getElementById('durum');
+const sonucKutu = document.getElementById('sonuc');
+const hataAyik = document.getElementById('hataAyik');
 const arac = document.getElementById('arac');
 const btnBasla = document.getElementById('basla');
+const btnKontrol = document.getElementById('kontrol');
 const btnKilitle = document.getElementById('kilitle');
 const btnDondur = document.getElementById('dondur');
 const btnKaldir = document.getElementById('kaldir');
 const btnCik = document.getElementById('cik');
 
 const ISARET_GENISLIK = ISARET_GENISLIK_MM / 1000;
-const PARCA_OFSET = (PARCA_OFSET_MM / 1000) * (ISARET_GENISLIK_MM / 100); // baskı ölçeği farklıysa ofset de aynı oranda değişir
-// İşaret uzayı (Chrome/ARCore): düzlem XZ, +Y kağıttan dışa (normal), +X sağa, +Z sayfada aşağı doğru.
-// Modelin +Y'si zaten normalle aynı, ek dönüş gerekmez.
-const ORNEK_SAYISI = 40;         // kilitlemeden önce işaret pozunun kaç kare ortalaması alınacak (~0,7 s)
-const YENIDEN_KILIT_M = 0.03;    // işaret, kilitli konumdan bu kadar (30 mm) uzakta görülürse kağıt oynamış say, yeniden kilitle
-const YENIDEN_KILIT_KARE = 45;   // ... ve bu sapma en az bu kadar kare art arda sürmeli
+const PARCA_OFSET = (PARCA_OFSET_MM / 1000) * (ISARET_GENISLIK_MM / 100);
 
 let kamera, sahne, renderer, kontrolcu, halka, isaretCerceve;
 let model = null;
+let bolgeIsaretleri = [];        // her bölge için sahnedeki küçük halka
 let yerlesik = false;
-let takipModu = 'isaret';        // 'isaret': işareti izle, 'elle': dokunarak yerleştirildi
+let takipModu = 'isaret';
 let isaretTakibiVar = false;
 let sonIsaretDurumu = '';
-let ornekler = [];               // kilitleme öncesi toplanan işaret pozları
-let kilitli = false;             // işaret pozu kilitlendi mi
-let capa = null;                 // WebXR anchor (ARCore çapası): dünyaya sabitlenmiş nokta
-let capaIsteniyor = false;
-let sabitMatris = null;          // çapa desteklenmiyorsa kullanılan sabit poz
-let sapmaKare = 0;
-const _mat = new THREE.Matrix4();
 let hitTestKaynagi = null;
 let hitTestIstendi = false;
 let isaretBitmap = null;
 let oturum = null;
 
+let ornekler = [];
+let kilitli = false;
+let capa = null;
+let capaIsteniyor = false;
+let sabitMatris = null;
+let sapmaKare = 0;
+
+let kontrolIstendi = false;
+let glBinding = null;
+let yakalayici = null;           // kamera görüntüsünü küçük tampona çeken WebGL yardımcı nesneleri
+
 const _poz = new THREE.Vector3(), _don = new THREE.Quaternion(), _olc = new THREE.Vector3(), _ofset = new THREE.Vector3();
+const _mat = new THREE.Matrix4();
 
 baslat();
 modeliYukle();
@@ -120,14 +172,12 @@ function baslat() {
   renderer.xr.setReferenceSpaceType('local');
   document.body.appendChild(renderer.domElement);
 
-  // Düğmelere dokunmak sahneye "yerleştir" olarak sayılmasın
   arac.addEventListener('beforexrselect', (e) => e.preventDefault());
 
   kontrolcu = renderer.xr.getController(0);
   kontrolcu.addEventListener('select', elleYerlestir);
   sahne.add(kontrolcu);
 
-  // Yüzey halkası (elle yerleştirme için)
   halka = new THREE.Mesh(
     new THREE.RingGeometry(0.03, 0.04, 32).rotateX(-Math.PI / 2),
     new THREE.MeshBasicMaterial({ color: 0x2ecc71 })
@@ -136,7 +186,6 @@ function baslat() {
   halka.visible = false;
   sahne.add(halka);
 
-  // İşaretin görüldüğü yerde çizilen çerçeve (kontrol amaçlı)
   const y = ISARET_GENISLIK / 2;
   isaretCerceve = new THREE.LineLoop(
     new THREE.BufferGeometry().setFromPoints([
@@ -145,7 +194,6 @@ function baslat() {
     ]),
     new THREE.LineBasicMaterial({ color: 0x2ecc71 })
   );
-  // Kırmızı nokta: işaretin alt kenar ortası (+Z). Kağıtta küp kutusuna bakan kenarda görünmeli.
   const altNokta = new THREE.Mesh(new THREE.SphereGeometry(0.005, 12, 8), new THREE.MeshBasicMaterial({ color: 0xff3b30 }));
   altNokta.position.set(0, 0, y);
   isaretCerceve.add(altNokta);
@@ -155,21 +203,20 @@ function baslat() {
 
   btnBasla.addEventListener('click', arBaslat);
   btnCik.addEventListener('click', () => { if (oturum) oturum.end(); });
+  btnKontrol.addEventListener('click', () => { kontrolIstendi = true; sonucKutu.textContent = 'Kontrol ediliyor...'; });
   btnKilitle.addEventListener('click', () => {
     takipModu = 'isaret';
     kilidiAc();
     btnKilitle.disabled = true;
     bilgi.textContent = 'Kamerayı işarete doğrult ve ölçüm bitene kadar sabit tut.';
   });
-  btnDondur.addEventListener('click', () => {
-    if (yerlesik) model.rotateY(THREE.MathUtils.degToRad(15));
-  });
+  btnDondur.addEventListener('click', () => { if (yerlesik) model.rotateY(THREE.MathUtils.degToRad(15)); });
   btnKaldir.addEventListener('click', () => {
     if (yerlesik) {
       sahne.remove(model);
       yerlesik = false;
       takipModu = 'elle';
-      btnDondur.disabled = btnKaldir.disabled = true;
+      btnDondur.disabled = btnKaldir.disabled = btnKontrol.disabled = true;
       btnKilitle.disabled = false;
       bilgi.textContent = 'Model kaldırıldı. Halkaya dokun ya da İşarete kilitle.';
     }
@@ -194,7 +241,12 @@ async function arBaslat() {
   if (!navigator.xr) { bilgi.textContent = 'Bu tarayıcı WebXR desteklemiyor. Android Chrome kullan.'; return; }
   if (!(await navigator.xr.isSessionSupported('immersive-ar'))) { bilgi.textContent = 'Bu cihazda AR desteklenmiyor.'; return; }
 
-  const temel = { requiredFeatures: ['hit-test', 'dom-overlay'], optionalFeatures: ['anchors'], domOverlay: { root: document.body } };
+  // camera-access: kamera görüntüsünü okuyup bölge kontrolü yapmak için (WebXR Incubations bayrağı gerekir)
+  const temel = {
+    requiredFeatures: ['hit-test', 'dom-overlay'],
+    optionalFeatures: ['anchors', 'camera-access'],
+    domOverlay: { root: document.body }
+  };
   try {
     if (!isaretBitmap) throw new Error('işaret yok');
     oturum = await navigator.xr.requestSession('immersive-ar', {
@@ -204,7 +256,6 @@ async function arBaslat() {
     });
     isaretTakibiVar = true;
   } catch (e) {
-    // İşaret takibi açılamadı: bayrak kapalı olabilir. Elle yerleştirmeyle devam et.
     try {
       oturum = await navigator.xr.requestSession('immersive-ar', temel);
     } catch (e2) {
@@ -216,9 +267,11 @@ async function arBaslat() {
   }
 
   await renderer.xr.setSession(oturum);
+  glBinding = null; yakalayici = null;
   btnBasla.classList.add('gizli');
-  [btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.remove('gizli'));
-  btnKilitle.disabled = true;   // zaten işaret modunda; elle yerleştirince açılır
+  [btnKontrol, btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.remove('gizli'));
+  btnKilitle.disabled = true;
+  btnKontrol.disabled = !yerlesik;
 
   if (isaretTakibiVar) {
     bilgi.textContent = 'Kamerayı basılı işarete doğrult.';
@@ -239,11 +292,13 @@ async function arBaslat() {
     if (yerlesik) { sahne.remove(model); yerlesik = false; }
     takipModu = 'isaret';
     kilidiAc();
+    glBinding = null; yakalayici = null;
     isaretCerceve.visible = false; halka.visible = false;
+    hataAyik.style.display = 'none';
     btnBasla.classList.remove('gizli');
-    [btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.add('gizli'));
+    [btnKontrol, btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.add('gizli'));
     bilgi.textContent = 'AR kapatıldı. Tekrar başlatabilirsin.';
-    durum.textContent = '';
+    durum.textContent = ''; sonucKutu.textContent = '';
   });
 }
 
@@ -259,23 +314,38 @@ function modeliYukle() {
       obj.position.set(-merkez.x, -kutu.min.y, -merkez.z);   // taban yerde, orta noktada
       model = new THREE.Group();
       model.add(obj);
+      bolgeIsaretleriniKur();
       const boyut = kutu.getSize(new THREE.Vector3()).multiplyScalar(1000);
-      bilgi.textContent = `Model hazır (${boyut.x.toFixed(0)} × ${boyut.y.toFixed(0)} × ${boyut.z.toFixed(0)} mm). AR'ı başlat ve kamerayı işarete doğrult.`;
+      bilgi.textContent = `Model hazır (${boyut.x.toFixed(0)} × ${boyut.y.toFixed(0)} × ${boyut.z.toFixed(0)} mm), ${BOLGELER.length} kontrol bölgesi. AR'ı başlat.`;
     },
     (ilerleme) => { if (ilerleme.total) bilgi.textContent = `Model yükleniyor %${Math.round(100 * ilerleme.loaded / ilerleme.total)}`; },
     () => { bilgi.textContent = 'Model yüklenemedi: ' + MODEL_OBJ + ' depoda var mı?'; });
   }, undefined, () => { bilgi.textContent = 'Renk dosyası yüklenemedi: ' + MODEL_MTL + ' depoda var mı?'; });
 }
 
+// Her kontrol bölgesine, yüzeyin 1 mm üstünde küçük bir halka koy (gri: kontrol edilmedi)
+function bolgeIsaretleriniKur() {
+  const r = BOLGE_YARICAP_MM / 1000;
+  const geo = new THREE.RingGeometry(r * 0.8, r * 1.1, 24);
+  bolgeIsaretleri = BOLGELER.map((b) => {
+    const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0x9e9e9e, side: THREE.DoubleSide, depthTest: false, transparent: true, opacity: 0.9 }));
+    const n = new THREE.Vector3(...b.normal);
+    m.position.set(b.konum[0] / 1000, b.konum[1] / 1000, b.konum[2] / 1000).addScaledVector(n, 0.001);
+    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);   // halka düzlemi yüzeye paralel
+    m.renderOrder = 10;
+    model.add(m);
+    return m;
+  });
+}
+
 function modeliGoster() {
   if (!yerlesik) {
     sahne.add(model);
     yerlesik = true;
-    btnDondur.disabled = btnKaldir.disabled = false;
+    btnDondur.disabled = btnKaldir.disabled = btnKontrol.disabled = false;
   }
 }
 
-// Verilen işaret pozundan (matris) modeli yerleştir: işaret merkezinden sayfa boyunca aşağı (+Z) PARCA_OFSET kadar
 function modeliIsaretPozunaKoy(matris) {
   matris.decompose(_poz, _don, _olc);
   _ofset.set(0, 0, PARCA_OFSET).applyQuaternion(_don);   // sayfada aşağı = +Z
@@ -285,10 +355,6 @@ function modeliIsaretPozunaKoy(matris) {
   modeliGoster();
 }
 
-// İşaret her karede görüldüğünde çağrılır. Önce ORNEK_SAYISI kare ölçüm toplar, ortalamasını alır,
-// sonra o pozu ARCore çapasına (anchor) bağlar. Çapa, dünyadaki sabit bir noktadır: ARCore kendi
-// haritasını düzelttiğinde çapayı da taşır, bu yüzden model kağıda göre kaymaz. Kilitlendikten sonra
-// işaretin anlık ölçümleri modele yansımaz; yalnızca kağıt gerçekten oynamışsa yeniden kilitlenir.
 function isaretGoruldu(poz, frame, referansAlani) {
   const t = poz.transform;
   if (!kilitli) {
@@ -298,7 +364,6 @@ function isaretGoruldu(poz, frame, referansAlani) {
     if (ornekler.length >= ORNEK_SAYISI) kilitle(ortalamaPoz(ornekler), frame, referansAlani);
     return;
   }
-  // Kilitli: kağıt oynamış mı? İşaretin görülen konumu kilitli konumdan uzun süre uzaksa yeniden kilitle
   const kilitliPoz = capa ? frame.getPose(capa.anchorSpace, referansAlani) : null;
   const kp = kilitliPoz ? kilitliPoz.transform.position : (sabitMatris ? { x: sabitMatris.elements[12], y: sabitMatris.elements[13], z: sabitMatris.elements[14] } : null);
   if (kp) {
@@ -311,7 +376,6 @@ function isaretGoruldu(poz, frame, referansAlani) {
   }
 }
 
-// Konumların ortancası (uç ölçümleri eler) ve yönelimlerin ortalaması
 function ortalamaPoz(ornekler) {
   const ortanca = (dizi) => { const s = [...dizi].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
   const p = [0, 1, 2].map(i => ortanca(ornekler.map(o => o.p[i])));
@@ -337,12 +401,12 @@ function kilitle(poz, frame, referansAlani) {
   if (typeof frame.createAnchor === 'function') {
     capaIsteniyor = true;
     frame.createAnchor(new XRRigidTransform(poz.position, poz.orientation), referansAlani)
-      .then((a) => { capa = a; kilitli = true; capaIsteniyor = false; durum.textContent = 'İşarete kilitlendi (çapa). Artık serbestçe dolaşabilirsin.'; })
+      .then((a) => { capa = a; kilitli = true; capaIsteniyor = false; durum.textContent = 'İşarete kilitlendi (çapa).'; })
       .catch(sabitle);
   } else {
     sabitle();
   }
-  bilgi.textContent = 'Model işarete göre yerleşti. Küpü kağıttaki kutuya koy ve karşılaştır.';
+  bilgi.textContent = 'Model yerleşti. Küpü kutuya koy, kameradan iyi görünürken "Kontrol et"e bas.';
 }
 
 function kilidiAc() {
@@ -360,6 +424,168 @@ function elleYerlestir() {
   bilgi.textContent = 'Elle yerleştirildi. Döndür ile hizala; işarete geri dönmek için İşarete kilitle.';
 }
 
+// ---- Kamera görüntüsünden bölge kontrolü -----------------------------
+// Kamera görüntüsü (WebXR camera-access) bir WebGL dokusu olarak gelir. Onu 320 px genişlikte küçük
+// bir tampona çizip piksellerini okuyoruz; sonra her bölgenin 3B merkezini görüntü düzlemine
+// projekte edip çevresindeki piksellerin ortalama rengine bakıyoruz.
+function yakalayiciKur(gl, W, H) {
+  const derle = (tip, kaynak) => { const s = gl.createShader(tip); gl.shaderSource(s, kaynak); gl.compileShader(s); return s; };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, derle(gl.VERTEX_SHADER, 'attribute vec2 a; varying vec2 v; void main(){ v = a*0.5+0.5; gl_Position = vec4(a,0.,1.); }'));
+  gl.attachShader(prog, derle(gl.FRAGMENT_SHADER, 'precision mediump float; uniform sampler2D t; varying vec2 v; void main(){ gl_FragColor = texture2D(t, v); }'));
+  gl.linkProgram(prog);
+  const aLoc = gl.getAttribLocation(prog, 'a');
+  const tLoc = gl.getUniformLocation(prog, 't');
+  const vao = gl.createVertexArray ? gl.createVertexArray() : null;
+  if (vao) gl.bindVertexArray(vao);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(aLoc);
+  gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
+  if (vao) gl.bindVertexArray(null);
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { prog, aLoc, tLoc, vao, buf, fbo, W, H, piksel: new Uint8Array(W * H * 4) };
+}
+
+function kareYakala(gl, kameraDokusu) {
+  const y = yakalayici;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, y.fbo);
+  gl.viewport(0, 0, y.W, y.H);
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.SCISSOR_TEST); gl.disable(gl.CULL_FACE);
+  gl.useProgram(y.prog);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, kameraDokusu);
+  gl.uniform1i(y.tLoc, 0);
+  if (y.vao) gl.bindVertexArray(y.vao);
+  else { gl.bindBuffer(gl.ARRAY_BUFFER, y.buf); gl.enableVertexAttribArray(y.aLoc); gl.vertexAttribPointer(y.aLoc, 2, gl.FLOAT, false, 0, 0); }
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.readPixels(0, 0, y.W, y.H, gl.RGBA, gl.UNSIGNED_BYTE, y.piksel);   // satırlar alttan üste
+  if (y.vao) gl.bindVertexArray(null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  renderer.resetState();   // Three.js'in durum önbelleğini sıfırla; bir sonraki karede kendi ayarlarını yeniden uygular
+}
+
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  let h = 0;
+  if (d > 0) {
+    if (max === r) h = 60 * (((g - b) / d) % 6);
+    else if (max === g) h = 60 * ((b - r) / d + 2);
+    else h = 60 * ((r - g) / d + 4);
+    if (h < 0) h += 360;
+  }
+  return { h, s: max === 0 ? 0 : d / max, v: max };
+}
+
+function renkKarari(hsv, beklenen) {
+  const k = RENKLER[beklenen];
+  if (!k) return { tamam: false, neden: 'tanımsız renk' };
+  if (k.notr) {
+    if (hsv.v < k.minV) return { tamam: false, neden: 'karanlık/boş' };
+    if (hsv.s > k.maxS) return { tamam: false, neden: 'renkli' };
+    return { tamam: true };
+  }
+  if (hsv.v < MIN_PARLAKLIK) return { tamam: false, neden: 'karanlık/boş' };
+  if (hsv.s < MIN_DOYGUNLUK) return { tamam: false, neden: 'renksiz' };
+  let fark = Math.abs(hsv.h - k.ton) % 360;
+  if (fark > 180) fark = 360 - fark;
+  return fark <= k.tol ? { tamam: true } : { tamam: false, neden: `farklı renk (ton ${hsv.h.toFixed(0)}°)` };
+}
+
+function kontrolYap(frame, referansAlani) {
+  const gorus = frame.getViewerPose(referansAlani);
+  if (!gorus) { sonucKutu.textContent = 'Kamera pozu alınamadı, tekrar dene.'; return; }
+  const view = gorus.views[0];
+  if (!view.camera) {
+    sonucKutu.innerHTML = '<span class="eksik">Kamera görüntüsüne erişim yok.</span> chrome://flags → "WebXR Incubations" Enabled mı? Chrome\'u yeniden başlatıp dene.';
+    return;
+  }
+  const gl = renderer.getContext();
+  if (!glBinding) glBinding = new XRWebGLBinding(oturum, gl);
+  const doku = glBinding.getCameraImage(view.camera);
+  if (!doku) { sonucKutu.textContent = 'Bu karede kamera görüntüsü yok, tekrar dene.'; return; }
+  if (!yakalayici) yakalayici = yakalayiciKur(gl, 320, Math.max(4, Math.round(320 * view.camera.height / view.camera.width)));
+  kareYakala(gl, doku);
+  const { W, H, piksel } = yakalayici;
+
+  // Dünya → görüntü: projeksiyon * kamera dönüşümünün tersi
+  const PV = new THREE.Matrix4().fromArray(view.projectionMatrix).multiply(new THREE.Matrix4().fromArray(view.transform.inverse.matrix));
+  const kameraKonum = new THREE.Vector3(view.transform.position.x, view.transform.position.y, view.transform.position.z);
+  model.updateMatrixWorld(true);
+
+  const dunya = new THREE.Vector3(), normalD = new THREE.Vector3(), bakis = new THREE.Vector3(), teget = new THREE.Vector3(), kenar = new THREE.Vector3(), ndc = new THREE.Vector3();
+  const noktalar = [];
+  let tamamSay = 0, eksikler = [], gorunmez = 0;
+  BOLGELER.forEach((b, i) => {
+    dunya.set(b.konum[0] / 1000, b.konum[1] / 1000, b.konum[2] / 1000);
+    model.localToWorld(dunya);
+    normalD.set(...b.normal).applyQuaternion(model.quaternion);
+    bakis.copy(kameraKonum).sub(dunya).normalize();
+    const isaret = bolgeIsaretleri[i];
+    if (normalD.dot(bakis) < 0.30) { gorunmez++; isaret.material.color.set(0x9e9e9e); return; }   // yüz kameraya bakmıyor
+
+    ndc.copy(dunya).applyMatrix4(PV);
+    if (Math.abs(ndc.x) > 0.98 || Math.abs(ndc.y) > 0.98 || ndc.z > 1) { gorunmez++; isaret.material.color.set(0x9e9e9e); return; }
+    const px = (ndc.x + 1) / 2 * W, py = (ndc.y + 1) / 2 * H;   // py alttan yukarı
+
+    // örnekleme yarıçapı: bölge yarıçapının görüntüdeki karşılığı
+    teget.crossVectors(normalD, Math.abs(normalD.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0)).normalize();
+    kenar.copy(dunya).addScaledVector(teget, BOLGE_YARICAP_MM / 1000).applyMatrix4(PV);
+    const r = Math.min(14, Math.max(2, Math.hypot((kenar.x - ndc.x) / 2 * W, (kenar.y - ndc.y) / 2 * H)));
+
+    let R = 0, G = 0, B = 0, n = 0;
+    for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dy * dy > r * r) continue;
+      const x = Math.round(px + dx), yy = Math.round(py + dy);
+      if (x < 0 || x >= W || yy < 0 || yy >= H) continue;
+      const k = (yy * W + x) * 4;
+      R += piksel[k]; G += piksel[k + 1]; B += piksel[k + 2]; n++;
+    }
+    if (!n) { gorunmez++; isaret.material.color.set(0x9e9e9e); return; }
+    const hsv = rgbToHsv(R / n, G / n, B / n);
+    const karar = renkKarari(hsv, b.renk);
+    if (karar.tamam) { tamamSay++; isaret.material.color.set(0x2ecc71); }
+    else { eksikler.push(`${b.ad}: ${karar.neden}`); isaret.material.color.set(0xff3b30); }
+    noktalar.push({ px, py, r, tamam: karar.tamam, rgb: [R / n, G / n, B / n] });
+  });
+
+  const kontrolEdilen = BOLGELER.length - gorunmez;
+  let html = `<span class="${eksikler.length ? 'eksik' : 'tamam'}">${tamamSay}/${kontrolEdilen} bölge tamam</span>`;
+  if (gorunmez) html += ` · ${gorunmez} bölge görüş dışında`;
+  if (eksikler.length) html += '<br>' + eksikler.map(e => `<span class="eksik">✗ ${e}</span>`).join('<br>');
+  sonucKutu.innerHTML = html;
+  hataAyiklamaCiz(W, H, piksel, noktalar);
+}
+
+// Sağ altta: yakalanan kamera karesi ve örneklenen noktalar (projeksiyon doğru mu diye)
+function hataAyiklamaCiz(W, H, piksel, noktalar) {
+  hataAyik.style.display = 'block';
+  const ara = document.createElement('canvas'); ara.width = W; ara.height = H;
+  const ctx = ara.getContext('2d');
+  const img = ctx.createImageData(W, H);
+  for (let y = 0; y < H; y++) {           // GL tamponu alttan üste; canvas üstten aşağı
+    img.data.set(piksel.subarray((H - 1 - y) * W * 4, (H - y) * W * 4), y * W * 4);
+  }
+  ctx.putImageData(img, 0, 0);
+  for (const n of noktalar) {
+    ctx.beginPath(); ctx.arc(n.px, H - 1 - n.py, Math.max(2, n.r), 0, Math.PI * 2);
+    ctx.lineWidth = 1.5; ctx.strokeStyle = n.tamam ? '#2ecc71' : '#ff3b30'; ctx.stroke();
+  }
+  hataAyik.width = W; hataAyik.height = H;
+  hataAyik.getContext('2d').drawImage(ara, 0, 0);
+}
+// ----------------------------------------------------------------------
+
 function boyutDegisti() {
   kamera.aspect = window.innerWidth / window.innerHeight;
   kamera.updateProjectionMatrix();
@@ -370,7 +596,6 @@ function ciz(zaman, frame) {
   if (frame && oturum) {
     const referansAlani = renderer.xr.getReferenceSpace();
 
-    // Yüzey halkası
     if (!hitTestIstendi) {
       oturum.requestReferenceSpace('viewer').then((bakisAlani) => {
         oturum.requestHitTestSource({ space: bakisAlani }).then((kaynak) => { hitTestKaynagi = kaynak; });
@@ -387,7 +612,6 @@ function ciz(zaman, frame) {
       }
     }
 
-    // İşaret takibi
     if (isaretTakibiVar && typeof frame.getImageTrackingResults === 'function') {
       let durumMetni = 'İşaret görünmüyor';
       for (const sonuc of frame.getImageTrackingResults()) {
@@ -408,7 +632,6 @@ function ciz(zaman, frame) {
         durum.textContent = durumMetni;
       }
 
-      // Kilitliyse model her karede çapanın (ya da sabit pozun) yerine oturur; işaret görünmese de.
       if (kilitli && model && takipModu === 'isaret') {
         if (capa) {
           const cp = frame.getPose(capa.anchorSpace, referansAlani);
@@ -418,6 +641,17 @@ function ciz(zaman, frame) {
         }
       }
     }
+
+    renderer.render(sahne, kamera);
+
+    // Kontrol, çizimden SONRA yapılır: kamera dokusu bu kare boyunca geçerli, sonrasında resetState ile
+    // Three.js durumu sıfırlanır ve bir sonraki karede yeniden kurulur.
+    if (kontrolIstendi && yerlesik) {
+      kontrolIstendi = false;
+      try { kontrolYap(frame, referansAlani); }
+      catch (e) { sonucKutu.textContent = 'Kontrol hatası: ' + e.message; renderer.resetState(); }
+    }
+    return;
   }
   renderer.render(sahne, kamera);
 }

@@ -156,6 +156,7 @@ let sapmaKare = 0;
 let elenenOrnek = 0;
 let beklemeKare = 0;
 let sonIpucuZamani = 0;
+let zeminY = [];                 // kilit sırasında yüzey halkasından okunan masa yükseklikleri
 
 let kontrolIstendi = false;
 let glBinding = null;
@@ -392,6 +393,11 @@ function isaretGoruldu(poz, frame, referansAlani) {
     }
     ornekler.push({ p: [t.position.x, t.position.y, t.position.z], q: [t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w] });
     if (ornekler.length > ORNEK_SAYISI) ornekler.shift();   // kayan pencere: en yeni 40 iyi ölçüm
+    // Masa yüksekliği: yüzey halkası masaya değiyorsa (işaretle aynı seviyede) onun Y'sini de topla
+    if (halka.visible) {
+      const hy = halka.matrix.elements[13];
+      if (Math.abs(hy - t.position.y) < 0.02) { zeminY.push(hy); if (zeminY.length > ORNEK_SAYISI) zeminY.shift(); }
+    }
     durum.textContent = `İşaret ölçülüyor ${ornekler.length}/${ORNEK_SAYISI} — telefonu sabit tut`;
     if (ornekler.length >= ORNEK_SAYISI) {
       const poz = ortalamaPoz(ornekler);
@@ -463,7 +469,28 @@ function ortalamaPoz(ornekler) {
   return { position: { x: p[0], y: p[1], z: p[2], w: 1 }, orientation: { x: q[0]/n, y: q[1]/n, z: q[2]/n, w: q[3]/n }, kullanilan: icerde.length, yayilimMM };
 }
 
+// İşaret masada yatay durduğu biliniyorsa ölçümün en zayıf bileşeni olan eğimi tamamen atarız:
+// yalnızca dikey eksen etrafındaki dönüş (kağıdın masadaki açısı) ölçümden alınır, normal tam yukarı zorlanır.
+// Yükseklik için de ARCore'un algıladığı masa düzlemi (yüzey halkası) kullanılır; o daha kararlıdır.
+function yatayaOtur(poz) {
+  const q = new THREE.Quaternion(poz.orientation.x, poz.orientation.y, poz.orientation.z, poz.orientation.w);
+  const z = new THREE.Vector3(0, 0, 1).applyQuaternion(q);   // sayfada "aşağı" yönü
+  z.y = 0;
+  if (z.lengthSq() < 1e-6) return poz;
+  z.normalize();
+  const y = new THREE.Vector3(0, 1, 0);
+  const x = new THREE.Vector3().crossVectors(y, z).normalize();
+  const q2 = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
+  let yukseklik = poz.position.y;
+  if (zeminY.length >= 5) {
+    const sirali = [...zeminY].sort((a, b) => a - b);
+    yukseklik = sirali[Math.floor(sirali.length / 2)];
+  }
+  return { ...poz, orientation: { x: q2.x, y: q2.y, z: q2.z, w: q2.w }, position: { ...poz.position, y: yukseklik, w: 1 } };
+}
+
 function kilitle(poz, frame, referansAlani) {
+  if (ISARET_YATAY) poz = yatayaOtur(poz);
   const sabitle = () => {
     sabitMatris = new THREE.Matrix4().compose(
       new THREE.Vector3(poz.position.x, poz.position.y, poz.position.z),
@@ -486,7 +513,7 @@ function kilitle(poz, frame, referansAlani) {
 function kilidiAc() {
   if (capa && typeof capa.delete === 'function') { try { capa.delete(); } catch (e) {} }
   capa = null; sabitMatris = null; kilitli = false; capaIsteniyor = false;
-  ornekler = []; sapmaKare = 0; elenenOrnek = 0; beklemeKare = 0;
+  ornekler = []; sapmaKare = 0; elenenOrnek = 0; beklemeKare = 0; zeminY = [];
 }
 
 function elleYerlestir() {

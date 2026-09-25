@@ -73,6 +73,7 @@ import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 // ---- Ayarlar ---------------------------------------------------------
+const SURUM = 13;                 // her yeni dosyada artar; ekranda görünür, doğru dosyanın yüklendiğini gösterir
 const MODEL_OBJ = 'parca.obj';
 const MODEL_MTL = 'parca.mtl';
 const MODEL_OLCEK = 0.001;        // model mm ise 0.001 (Three.js metre kullanır)
@@ -82,8 +83,9 @@ const ISARET_GENISLIK_MM = 100;   // kağıttaki işaretin cetvelle ölçülen d
 const PARCA_OFSET_MM = 100;       // işaret merkezinden parça yerinin merkezine, sayfada aşağı doğru (%100 baskıda)
 
 const ORNEK_SAYISI = 40;          // kilitlemeden önce işaret pozunun kaç kare ortalaması alınacak (~0,7 s)
-const YENIDEN_KILIT_M = 0.03;     // işaret, kilitli konumdan bu kadar (30 mm) uzakta görülürse kağıt oynamış say
-const YENIDEN_KILIT_KARE = 45;    // ... ve bu sapma en az bu kadar kare art arda sürmeli
+const YENIDEN_KILIT_M = 0.012;    // iyi görüş koşullarında işaret, kilitli konumdan bu kadar (12 mm) uzakta görülürse yeniden kilitle
+const YENIDEN_KILIT_KARE = 45;    // ... ve bu sapma en az bu kadar (iyi) kare art arda sürmeli
+const MODEL_SEFFAFLIK = 0.6;      // model yarı saydam çizilir ki gerçek parça altından görünsün, kayma fark edilsin
 const ISARET_YATAY = true;        // işaret yatay bir masada duruyor: normali yukarı bakmayan ölçümler elenir
 const MAKS_EGIM_DERECE = 20;      // işaret normali ile "yukarı" arasındaki izin verilen en büyük açı
 // Ölçüm kalite süzgeci: kilit yalnızca iyi görüş koşullarında alınan ölçümlerle yapılır
@@ -98,7 +100,7 @@ const MAKS_BEKLEME_KARE = 300;    // ~5 s içinde tutarlılık sağlanamazsa eld
 // Koordinatlar model uzayında, mm; orijin modelin TABAN MERKEZİ (uygulama modeli böyle yerleştirir).
 // Her bölge: ad, merkez konumu, yüzey normali (kameraya bakıyor mu diye), beklenen renk.
 // Gerçek parçada bu liste CAD'den üretilecek; küp için 3 görünür yüzün 9'ar etiketi.
-const BOLGE_YARICAP_MM = 5;       // her bölgede örneklenen dairenin yarıçapı (etiket 15,6 mm)
+const BOLGE_YARICAP_MM = 3.5;     // her bölgede örneklenen dairenin yarıçapı (etiket 15,6 mm; küçük yarıçap birkaç mm kaymayı tolere eder)
 const P = 55 / 3;
 const BOLGELER = [];
 {
@@ -186,6 +188,8 @@ let yakalayici = null;           // kamera görüntüsünü küçük tampona çe
 const _poz = new THREE.Vector3(), _don = new THREE.Quaternion(), _olc = new THREE.Vector3(), _ofset = new THREE.Vector3();
 const _mat = new THREE.Matrix4();
 
+document.title = `Parça Kontrol – sürüm ${SURUM}`;
+bilgi.textContent = `Model yükleniyor... (sürüm ${SURUM})`;
 baslat();
 modeliYukle();
 isaretiHazirla();
@@ -347,7 +351,7 @@ async function arBaslat() {
     btnBasla.classList.remove('gizli');
     [btnKontrol, btnCanli, btnOgret, btnOgretSil, btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.add('gizli'));
     canli = false; btnCanli.classList.remove('acik'); btnCanli.textContent = 'Canlı';
-    bilgi.textContent = 'AR kapatıldı. Tekrar başlatabilirsin.';
+    bilgi.textContent = `AR kapatıldı. Tekrar başlatabilirsin. (sürüm ${SURUM})`;
     durum.textContent = ''; sonucKutu.textContent = '';
   });
 }
@@ -359,6 +363,10 @@ function modeliYukle() {
     yukleyici.setMaterials(malzemeler);
     yukleyici.load(MODEL_OBJ, (obj) => {
       obj.scale.setScalar(MODEL_OLCEK);
+      obj.traverse((o) => {
+        if (!o.isMesh) return;
+        (Array.isArray(o.material) ? o.material : [o.material]).forEach((m) => { m.transparent = true; m.opacity = MODEL_SEFFAFLIK; });
+      });
       const kutu = new THREE.Box3().setFromObject(obj);
       const merkez = kutu.getCenter(new THREE.Vector3());
       obj.position.set(-merkez.x, -kutu.min.y, -merkez.z);   // taban yerde, orta noktada
@@ -366,7 +374,7 @@ function modeliYukle() {
       model.add(obj);
       bolgeIsaretleriniKur();
       const boyut = kutu.getSize(new THREE.Vector3()).multiplyScalar(1000);
-      bilgi.textContent = `Model hazır (${boyut.x.toFixed(0)} × ${boyut.y.toFixed(0)} × ${boyut.z.toFixed(0)} mm), ${BOLGELER.length} kontrol bölgesi. AR'ı başlat.`;
+      bilgi.textContent = `Model hazır (${boyut.x.toFixed(0)} × ${boyut.y.toFixed(0)} × ${boyut.z.toFixed(0)} mm), ${BOLGELER.length} kontrol bölgesi. AR'ı başlat. (sürüm ${SURUM})`;
     },
     (ilerleme) => { if (ilerleme.total) bilgi.textContent = `Model yükleniyor %${Math.round(100 * ilerleme.loaded / ilerleme.total)}`; },
     () => { bilgi.textContent = 'Model yüklenemedi: ' + MODEL_OBJ + ' depoda var mı?'; });
@@ -449,6 +457,8 @@ function isaretGoruldu(poz, frame, referansAlani) {
     }
     return;
   }
+  // Kilitliyken sapma denetimi yalnızca iyi görüş koşullarında yapılır; yatık/uzak bakışta işaret ölçümü zaten sapar.
+  if (gorusKalitesi(t, frame, referansAlani)) { sapmaKare = 0; return; }
   const kilitliPoz = capa ? frame.getPose(capa.anchorSpace, referansAlani) : null;
   const kp = kilitliPoz ? kilitliPoz.transform.position : (sabitMatris ? { x: sabitMatris.elements[12], y: sabitMatris.elements[13], z: sabitMatris.elements[14] } : null);
   if (kp) {
@@ -456,7 +466,7 @@ function isaretGoruldu(poz, frame, referansAlani) {
     sapmaKare = d > YENIDEN_KILIT_M ? sapmaKare + 1 : 0;
     if (sapmaKare >= YENIDEN_KILIT_KARE) {
       kilidiAc();
-      bilgi.textContent = 'İşaret yer değiştirmiş görünüyor, yeniden ölçülüyor. Telefonu sabit tut.';
+      bilgi.textContent = 'Hizalama kaymış görünüyor, yeniden ölçülüyor. Telefonu sabit tut.';
     }
   }
 }
@@ -672,16 +682,18 @@ function bolgeleriOlc(frame, referansAlani) {
     teget.crossVectors(normalD, Math.abs(normalD.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0)).normalize();
     kenar.copy(dunya).addScaledVector(teget, BOLGE_YARICAP_MM / 1000).applyMatrix4(PV);
     const r = Math.min(14, Math.max(2, Math.hypot((kenar.x - ndc.x) / 2 * W, (kenar.y - ndc.y) / 2 * H)));
-    let R = 0, G = 0, B = 0, n = 0;
+    // Kanal başına ORTANCA: daire kısmen komşu yüze/boşluğa taşsa bile (pikselerin yarısından azı) sonuç bozulmaz
+    const Rs = [], Gs = [], Bs = [];
     for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
       if (dx * dx + dy * dy > r * r) continue;
       const x = Math.round(px + dx), yy = Math.round(py + dy);
       if (x < 0 || x >= W || yy < 0 || yy >= H) continue;
       const k = (yy * W + x) * 4;
-      R += piksel[k]; G += piksel[k + 1]; B += piksel[k + 2]; n++;
+      Rs.push(piksel[k]); Gs.push(piksel[k + 1]); Bs.push(piksel[k + 2]);
     }
-    if (!n) return { gorunur: false };
-    return { gorunur: true, px, py, r, rgb: [R / n, G / n, B / n] };
+    if (!Rs.length) return { gorunur: false };
+    const ort = (d) => { d.sort((a, b) => a - b); return d[d.length >> 1]; };
+    return { gorunur: true, px, py, r, rgb: [ort(Rs), ort(Gs), ort(Bs)] };
   });
   return { olcumler, W, H, piksel };
 }

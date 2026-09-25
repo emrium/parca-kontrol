@@ -22,7 +22,7 @@
   #sonuc .tamam { color: #7CFC9A; }
   #sonuc .eksik { color: #FF7B72; font-weight: 600; }
   #hataAyik {
-    position: absolute; right: 8px; bottom: 96px; width: 160px; height: 120px;
+    position: absolute; right: 8px; bottom: 96px; width: 120px; height: auto;
     border: 1px solid rgba(255,255,255,.6); background: #000; display: none;
   }
   #arac {
@@ -125,8 +125,8 @@ const MIN_DOYGUNLUK = 0.22;       // renkli etiket için en az doygunluk (siyah 
 const MIN_PARLAKLIK = 0.18;
 // Öğretilmiş referansla karşılaştırma (Öğret düğmesiyle sağlam parçadan alınan renkler)
 const KROMA_ESIGI = 0.08;         // renk oranlarında (r,g)/(r+g+b) izin verilen fark; ışık şiddetinden bağımsız
-const PARLAKLIK_ORAN_MIN = 0.55;  // örneğin parlaklığı referansın en az %55'i olmalı (siyah bant/boşluk bunun altına düşer)
-const PARLAKLIK_ORAN_MAKS = 1.8;
+const PARLAKLIK_ORAN_MIN = 0.50;  // örneğin parlaklığı (genel ışık düzeltmesinden sonra) referansın en az %50'si olmalı
+const PARLAKLIK_ORAN_MAKS = 2.2;  // ... ve en fazla 2,2 katı (parlama)
 const CANLI_KARE_ARALIGI = 6;     // canlı modda her kaçıncı karede kontrol yapılır (~10 Hz)
 const CANLI_HATA_KARARLILIGI = 2; // canlı modda bir bölgenin kırmızıya dönmesi için art arda kaç kontrolde hatalı çıkmalı
 // ----------------------------------------------------------------------
@@ -687,8 +687,10 @@ function bolgeleriOlc(frame, referansAlani) {
 }
 
 // Öğretilmiş referansla karşılaştırma: renk oranları (ışık şiddetinden bağımsız) + parlaklık oranı
-function ogretilenKarar(rgb, referanslar) {
-  const kroma = (c) => { const t = c[0] + c[1] + c[2] + 1e-6; return [c[0] / t, c[1] / t, (c[0] + c[1] + c[2]) / 3]; };
+const kroma = (c) => { const t = c[0] + c[1] + c[2] + 1e-6; return [c[0] / t, c[1] / t, (c[0] + c[1] + c[2]) / 3]; };
+
+// Bir ölçümün, öğretilmiş referanslardan en yakınına göre parlaklık oranı (ışık değişimini ölçmek için)
+function parlaklikOrani(rgb, referanslar) {
   const [r1, g1, v1] = kroma(rgb);
   let enIyi = Infinity, oran = 1;
   for (const ref of referanslar) {
@@ -696,16 +698,36 @@ function ogretilenKarar(rgb, referanslar) {
     const d = Math.hypot(r1 - r2, g1 - g2);
     if (d < enIyi) { enIyi = d; oran = v1 / (v2 + 1e-6); }
   }
-  if (oran < PARLAKLIK_ORAN_MIN) return { tamam: false, neden: 'karanlık/boş' };
-  if (oran > PARLAKLIK_ORAN_MAKS) return { tamam: false, neden: 'çok parlak/yansıma' };
-  if (enIyi > KROMA_ESIGI) return { tamam: false, neden: 'farklı renk' };
+  return { kromaFarki: enIyi, oran };
+}
+
+// genelOran: o karede tüm bölgelerin ortak ışık değişimi (gölge, pozlama). Tek bir bölge bundan sapıyorsa hata.
+function ogretilenKarar(rgb, referanslar, genelOran = 1) {
+  const { kromaFarki, oran } = parlaklikOrani(rgb, referanslar);
+  const goreli = oran / genelOran;
+  if (goreli < PARLAKLIK_ORAN_MIN) return { tamam: false, neden: 'karanlık/boş' };
+  if (goreli > PARLAKLIK_ORAN_MAKS) return { tamam: false, neden: 'çok parlak/yansıma' };
+  if (kromaFarki > KROMA_ESIGI) return { tamam: false, neden: 'farklı renk' };
   return { tamam: true };
 }
 
-function bolgeKarari(b, rgb) {
+function bolgeKarari(b, rgb, genelOran) {
   const ref = ogretilen[b.ad];
-  if (ref && ref.length) return ogretilenKarar(rgb, ref);
+  if (ref && ref.length) return ogretilenKarar(rgb, ref, genelOran);
   return renkKarari(rgbToHsv(rgb[0], rgb[1], rgb[2]), b.renk);   // öğretilmemişse CAD rengi kuralı
+}
+
+// Karedeki genel ışık değişimi: öğretilmiş ve görünen bölgelerin parlaklık oranlarının ortancası.
+// Eksik/kapalı bir bölge azınlıkta kaldığı sürece ortancayı etkilemez.
+function genelIsikOrani(olcumler) {
+  const oranlar = [];
+  olcumler.forEach((o, i) => {
+    const ref = ogretilen[BOLGELER[i].ad];
+    if (o.gorunur && ref && ref.length) oranlar.push(parlaklikOrani(o.rgb, ref).oran);
+  });
+  if (oranlar.length < 3) return 1;
+  oranlar.sort((a, b) => a - b);
+  return oranlar[Math.floor(oranlar.length / 2)];
 }
 
 function kontrolYap(frame, referansAlani, canliMod) {
@@ -713,11 +735,12 @@ function kontrolYap(frame, referansAlani, canliMod) {
   if (sonuc.hata) { sonucKutu.innerHTML = sonuc.hata; return; }
   const { olcumler, W, H, piksel } = sonuc;
   const noktalar = [];
+  const genelOran = genelIsikOrani(olcumler);
   let tamamSay = 0, eksikler = [], gorunmez = 0;
   olcumler.forEach((o, i) => {
     const isaret = bolgeIsaretleri[i];
     if (!o.gorunur) { gorunmez++; isaret.material.color.set(0x9e9e9e); hataSayaci[i] = 0; return; }
-    const karar = bolgeKarari(BOLGELER[i], o.rgb);
+    const karar = bolgeKarari(BOLGELER[i], o.rgb, genelOran);
     let hatali = !karar.tamam;
     if (canliMod) {   // canlıda tek karelik titremeleri ele: art arda hata gerekir
       hataSayaci[i] = hatali ? (hataSayaci[i] || 0) + 1 : 0;
@@ -730,7 +753,7 @@ function kontrolYap(frame, referansAlani, canliMod) {
   const kontrolEdilen = BOLGELER.length - gorunmez;
   let html = `<span class="${eksikler.length ? 'eksik' : 'tamam'}">${tamamSay}/${kontrolEdilen} bölge tamam</span>`;
   if (gorunmez) html += ` · ${gorunmez} görüş dışında`;
-  if (Object.keys(ogretilen).length) html += ' · öğretilmiş referans';
+  if (Object.keys(ogretilen).length) html += ` · öğretilmiş referans, ışık ×${genelOran.toFixed(2)}`;
   if (eksikler.length) html += '<br>' + eksikler.map(e => `<span class="eksik">✗ ${e}</span>`).join('<br>');
   sonucKutu.innerHTML = html;
   if (!canliMod || kareSayaci % 30 === 0) hataAyiklamaCiz(W, H, piksel, noktalar);

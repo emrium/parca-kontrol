@@ -38,6 +38,11 @@
   #kontrol { background: #ffd54a; font-weight: 600; }
   #canli.acik { background: #ffd54a; font-weight: 600; }
   #ogret { background: #9ad0ff; }
+  #ayarPanel { display: none; position: absolute; bottom: 150px; left: 0; right: 0; text-align: center; }
+  #ayarPanel.acik { display: block; }
+  #ayarPanel .satir { display: flex; justify-content: center; gap: 6px; margin: 4px 0; }
+  #ayarPanel button { padding: 8px 12px; font-size: 13px; border: 0; border-radius: 6px; background: rgba(255,255,255,.85); color: #1c1f24; }
+  #ayarPanel .okuma { font-size: 13px; text-shadow: 0 1px 3px rgba(0,0,0,.8); margin-bottom: 4px; }
   .gizli { display: none !important; }
 </style>
 </head>
@@ -46,8 +51,15 @@
 <div id="durum"></div>
 <div id="sonuc"></div>
 <canvas id="hataAyik" width="160" height="120"></canvas>
+<div id="ayarPanel">
+  <div class="okuma" id="ayarOkuma"></div>
+  <div class="satir"><button data-eksen="x" data-yon="-1">◀ Sol</button><button data-eksen="x" data-yon="1">Sağ ▶</button></div>
+  <div class="satir"><button data-eksen="z" data-yon="-1">▲ İşarete yaklaş</button><button data-eksen="z" data-yon="1">▼ İşaretten uzaklaş</button></div>
+  <div class="satir"><button data-eksen="y" data-yon="1">⬆ Yükselt</button><button data-eksen="y" data-yon="-1">⬇ Alçalt</button><button id="ayarSifirla">Sıfırla</button></div>
+</div>
 <div id="arac">
   <button id="basla">AR'ı başlat</button>
+  <button id="ayar" class="gizli">Ayar</button>
   <button id="kontrol" class="gizli" disabled>Kontrol et</button>
   <button id="canli" class="gizli" disabled>Canlı</button>
   <button id="ogret" class="gizli" disabled>Öğret</button>
@@ -73,7 +85,7 @@ import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 // ---- Ayarlar ---------------------------------------------------------
-const SURUM = 13;                 // her yeni dosyada artar; ekranda görünür, doğru dosyanın yüklendiğini gösterir
+const SURUM = 14;                 // her yeni dosyada artar; ekranda görünür, doğru dosyanın yüklendiğini gösterir
 const MODEL_OBJ = 'parca.obj';
 const MODEL_MTL = 'parca.mtl';
 const MODEL_OLCEK = 0.001;        // model mm ise 0.001 (Three.js metre kullanır)
@@ -86,6 +98,8 @@ const ORNEK_SAYISI = 40;          // kilitlemeden önce işaret pozunun kaç kar
 const YENIDEN_KILIT_M = 0.012;    // iyi görüş koşullarında işaret, kilitli konumdan bu kadar (12 mm) uzakta görülürse yeniden kilitle
 const YENIDEN_KILIT_KARE = 45;    // ... ve bu sapma en az bu kadar (iyi) kare art arda sürmeli
 const MODEL_SEFFAFLIK = 0.6;      // model yarı saydam çizilir ki gerçek parça altından görünsün, kayma fark edilsin
+const ZEMIN_YUKSEKLIGINI_KULLAN = false; // true: yükseklik ARCore düzleminden; false: işaretin kendi ölçümünden (daha doğru çıktı)
+const AYAR_ADIMI_MM = 2;          // ince ayar düğmelerinin her basışta kaydırdığı miktar
 const ISARET_YATAY = true;        // işaret yatay bir masada duruyor: normali yukarı bakmayan ölçümler elenir
 const MAKS_EGIM_DERECE = 20;      // işaret normali ile "yukarı" arasındaki izin verilen en büyük açı
 // Ölçüm kalite süzgeci: kilit yalnızca iyi görüş koşullarında alınan ölçümlerle yapılır
@@ -143,6 +157,9 @@ const btnKontrol = document.getElementById('kontrol');
 const btnCanli = document.getElementById('canli');
 const btnOgret = document.getElementById('ogret');
 const btnOgretSil = document.getElementById('ogretSil');
+const btnAyar = document.getElementById('ayar');
+const ayarPanel = document.getElementById('ayarPanel');
+const ayarOkuma = document.getElementById('ayarOkuma');
 const btnKilitle = document.getElementById('kilitle');
 const btnDondur = document.getElementById('dondur');
 const btnKaldir = document.getElementById('kaldir');
@@ -176,6 +193,11 @@ let zeminY = [];                 // kilit sırasında yüzey halkasından okunan
 
 let kontrolIstendi = false;
 let ogretIstendi = false;
+// İnce ayar (kalibrasyon): işaret eksenlerinde mm cinsinden düzeltme; telefonda saklanır.
+// Her kilitte aynı düzeltme gerekiyorsa hata sistematiktir ve buradan kalıcı olarak giderilir.
+const AYAR_ANAHTAR = 'ayar:' + MODEL_OBJ;
+let ayar = { x: 0, y: 0, z: 0 };
+try { ayar = { x: 0, y: 0, z: 0, ...JSON.parse(localStorage.getItem(AYAR_ANAHTAR) || '{}') }; } catch (e) {}
 let canli = false;
 let kareSayaci = 0;
 let hataSayaci = [];             // canlı modda bölge başına art arda hata sayısı
@@ -250,6 +272,16 @@ function baslat() {
     if (!canli) sonucKutu.textContent = '';
   });
   btnOgret.addEventListener('click', () => { ogretIstendi = true; sonucKutu.textContent = 'Öğreniyor...'; });
+  btnAyar.addEventListener('click', () => { ayarPanel.classList.toggle('acik'); ayarOkumaGuncelle(); });
+  ayarPanel.addEventListener('beforexrselect', (e) => e.preventDefault());
+  ayarPanel.querySelectorAll('button[data-eksen]').forEach((b) => {
+    b.addEventListener('click', () => {
+      ayar[b.dataset.eksen] += AYAR_ADIMI_MM * Number(b.dataset.yon);
+      ayariKaydet();
+    });
+  });
+  document.getElementById('ayarSifirla').addEventListener('click', () => { ayar = { x: 0, y: 0, z: 0 }; ayariKaydet(); });
+  ayarOkumaGuncelle();
   btnOgretSil.addEventListener('click', () => {
     ogretilen = {};
     localStorage.removeItem(OGRET_ANAHTAR);
@@ -322,7 +354,7 @@ async function arBaslat() {
   await renderer.xr.setSession(oturum);
   glBinding = null; yakalayici = null;
   btnBasla.classList.add('gizli');
-  [btnKontrol, btnCanli, btnOgret, btnOgretSil, btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.remove('gizli'));
+  [btnKontrol, btnCanli, btnOgret, btnOgretSil, btnAyar, btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.remove('gizli'));
   btnKilitle.disabled = true;
   btnKontrol.disabled = btnCanli.disabled = btnOgret.disabled = !yerlesik;
 
@@ -349,7 +381,8 @@ async function arBaslat() {
     isaretCerceve.visible = false; halka.visible = false;
     hataAyik.style.display = 'none';
     btnBasla.classList.remove('gizli');
-    [btnKontrol, btnCanli, btnOgret, btnOgretSil, btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.add('gizli'));
+    [btnKontrol, btnCanli, btnOgret, btnOgretSil, btnAyar, btnKilitle, btnDondur, btnKaldir, btnCik].forEach(b => b.classList.add('gizli'));
+    ayarPanel.classList.remove('acik');
     canli = false; btnCanli.classList.remove('acik'); btnCanli.textContent = 'Canlı';
     bilgi.textContent = `AR kapatıldı. Tekrar başlatabilirsin. (sürüm ${SURUM})`;
     durum.textContent = ''; sonucKutu.textContent = '';
@@ -404,9 +437,22 @@ function modeliGoster() {
   }
 }
 
+function ayariKaydet() {
+  try { localStorage.setItem(AYAR_ANAHTAR, JSON.stringify(ayar)); } catch (e) {}
+  ayarOkumaGuncelle();
+  if (yerlesik && kilitli && takipModu === 'isaret') {
+    if (capa === null && sabitMatris) modeliIsaretPozunaKoy(sabitMatris);   // çapa varsa bir sonraki karede zaten uygulanır
+  }
+}
+function ayarOkumaGuncelle() {
+  ayarOkuma.textContent = `Düzeltme — sağ/sol: ${ayar.x > 0 ? '+' : ''}${ayar.x} mm, yükseklik: ${ayar.y > 0 ? '+' : ''}${ayar.y} mm, işaret yönü: ${ayar.z > 0 ? '+' : ''}${ayar.z} mm`;
+  btnAyar.textContent = (ayar.x || ayar.y || ayar.z) ? 'Ayar ●' : 'Ayar';
+}
+
 function modeliIsaretPozunaKoy(matris) {
   matris.decompose(_poz, _don, _olc);
-  _ofset.set(0, 0, PARCA_OFSET).applyQuaternion(_don);   // sayfada aşağı = +Z
+  // sayfada aşağı = +Z; ince ayar düzeltmesi de işaret eksenlerinde eklenir
+  _ofset.set(ayar.x / 1000, ayar.y / 1000, PARCA_OFSET + ayar.z / 1000).applyQuaternion(_don);
   model.position.copy(_poz).add(_ofset);
   model.quaternion.copy(_don);
   model.scale.set(1, 1, 1);
@@ -529,7 +575,7 @@ function yatayaOtur(poz) {
   const x = new THREE.Vector3().crossVectors(y, z).normalize();
   const q2 = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
   let yukseklik = poz.position.y;
-  if (zeminY.length >= 5) {
+  if (ZEMIN_YUKSEKLIGINI_KULLAN && zeminY.length >= 5) {
     const sirali = [...zeminY].sort((a, b) => a - b);
     yukseklik = sirali[Math.floor(sirali.length / 2)];
   }

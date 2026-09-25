@@ -85,7 +85,7 @@ import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 // ---- Ayarlar ---------------------------------------------------------
-const SURUM = 14;                 // her yeni dosyada artar; ekranda görünür, doğru dosyanın yüklendiğini gösterir
+const SURUM = 15;                 // her yeni dosyada artar; ekranda görünür, doğru dosyanın yüklendiğini gösterir
 const MODEL_OBJ = 'parca.obj';
 const MODEL_MTL = 'parca.mtl';
 const MODEL_OLCEK = 0.001;        // model mm ise 0.001 (Three.js metre kullanır)
@@ -94,7 +94,10 @@ const ISARET_DOSYA = 'isaret.png';
 const ISARET_GENISLIK_MM = 100;   // kağıttaki işaretin cetvelle ölçülen dış genişliği
 const PARCA_OFSET_MM = 100;       // işaret merkezinden parça yerinin merkezine, sayfada aşağı doğru (%100 baskıda)
 
-const ORNEK_SAYISI = 40;          // kilitlemeden önce işaret pozunun kaç kare ortalaması alınacak (~0,7 s)
+const ORNEK_SAYISI = 90;          // kilitlemeden önce toplanacak iyi ölçüm sayısı (~2 s)
+const MIN_KAMERA_YOLU_M = 0.04;   // ölçümler en az 4 cm'lik kamera hareketi boyunca alınmalı: tek bakış açısının
+                                  // sistematik hatası böyle ortalanır ("telefonu yavaşça hafif gezdir")
+const SISTEMATIK_DUZELTME = { x: 0, y: -4, z: 0 }; // mm; iki ayrı kilitte de gereken düzeltme, kalıcı olarak uygulanır
 const YENIDEN_KILIT_M = 0.012;    // iyi görüş koşullarında işaret, kilitli konumdan bu kadar (12 mm) uzakta görülürse yeniden kilitle
 const YENIDEN_KILIT_KARE = 45;    // ... ve bu sapma en az bu kadar (iyi) kare art arda sürmeli
 const MODEL_SEFFAFLIK = 0.6;      // model yarı saydam çizilir ki gerçek parça altından görünsün, kayma fark edilsin
@@ -106,7 +109,7 @@ const MAKS_EGIM_DERECE = 20;      // işaret normali ile "yukarı" arasındaki i
 const MAKS_MESAFE_M = 0.60;       // kamera-işaret uzaklığı en fazla 60 cm
 const MAKS_BAKIS_ACISI = 35;      // işaret normali ile bakış doğrultusu arası en fazla 35° (tepeden bakış = 0°)
 const MERKEZ_SINIRI = 0.6;        // işaret merkezi görüntünün orta %60'lık alanında olmalı (-0.6..0.6)
-const TUTARLILIK_MM = 4;          // 40 ölçümün konumları ortancadan en fazla bu kadar sapmalı
+const TUTARLILIK_MM = 10;         // ölçümlerin konumları ortancadan en fazla bu kadar sapmalı (farklı açılardan ölçüm normal olarak biraz yayılır)
 const TUTARLILIK_ORAN = 0.8;      // ölçümlerin en az %80'i yönelim olarak birbiriyle uyumlu olmalı
 const MAKS_BEKLEME_KARE = 300;    // ~5 s içinde tutarlılık sağlanamazsa eldeki en iyi ölçümle kilitle
 
@@ -190,12 +193,13 @@ let elenenOrnek = 0;
 let beklemeKare = 0;
 let sonIpucuZamani = 0;
 let zeminY = [];                 // kilit sırasında yüzey halkasından okunan masa yükseklikleri
+let kameraYolu = [];             // ölçüm sırasında kamera konumları (bakış açısı çeşitliliği için)
 
 let kontrolIstendi = false;
 let ogretIstendi = false;
 // İnce ayar (kalibrasyon): işaret eksenlerinde mm cinsinden düzeltme; telefonda saklanır.
 // Her kilitte aynı düzeltme gerekiyorsa hata sistematiktir ve buradan kalıcı olarak giderilir.
-const AYAR_ANAHTAR = 'ayar:' + MODEL_OBJ;
+const AYAR_ANAHTAR = 'ayar2:' + MODEL_OBJ;   // anahtar değişti: eski elle ayar sıfırlanır, sistematik kısım artık kodda
 let ayar = { x: 0, y: 0, z: 0 };
 try { ayar = { x: 0, y: 0, z: 0, ...JSON.parse(localStorage.getItem(AYAR_ANAHTAR) || '{}') }; } catch (e) {}
 let canli = false;
@@ -452,7 +456,7 @@ function ayarOkumaGuncelle() {
 function modeliIsaretPozunaKoy(matris) {
   matris.decompose(_poz, _don, _olc);
   // sayfada aşağı = +Z; ince ayar düzeltmesi de işaret eksenlerinde eklenir
-  _ofset.set(ayar.x / 1000, ayar.y / 1000, PARCA_OFSET + ayar.z / 1000).applyQuaternion(_don);
+  _ofset.set((SISTEMATIK_DUZELTME.x + ayar.x) / 1000, (SISTEMATIK_DUZELTME.y + ayar.y) / 1000, PARCA_OFSET + (SISTEMATIK_DUZELTME.z + ayar.z) / 1000).applyQuaternion(_don);
   model.position.copy(_poz).add(_ofset);
   model.quaternion.copy(_don);
   model.scale.set(1, 1, 1);
@@ -483,21 +487,26 @@ function isaretGoruldu(poz, frame, referansAlani) {
       return;
     }
     ornekler.push({ p: [t.position.x, t.position.y, t.position.z], q: [t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w] });
-    if (ornekler.length > ORNEK_SAYISI) ornekler.shift();   // kayan pencere: en yeni 40 iyi ölçüm
+    if (ornekler.length > ORNEK_SAYISI) ornekler.shift();   // kayan pencere: en yeni iyi ölçümler
+    const gorus = frame.getViewerPose(referansAlani);
+    if (gorus) { const k = gorus.transform.position; kameraYolu.push([k.x, k.y, k.z]); if (kameraYolu.length > ORNEK_SAYISI) kameraYolu.shift(); }
     // Masa yüksekliği: yüzey halkası masaya değiyorsa (işaretle aynı seviyede) onun Y'sini de topla
     if (halka.visible) {
       const hy = halka.matrix.elements[13];
       if (Math.abs(hy - t.position.y) < 0.02) { zeminY.push(hy); if (zeminY.length > ORNEK_SAYISI) zeminY.shift(); }
     }
-    durum.textContent = `İşaret ölçülüyor ${ornekler.length}/${ORNEK_SAYISI} — telefonu sabit tut`;
+    const yol = kameraYayilimi();
+    durum.textContent = `İşaret ölçülüyor ${ornekler.length}/${ORNEK_SAYISI} — telefonu yavaşça hafif gezdir (${(yol * 100).toFixed(0)}/${(MIN_KAMERA_YOLU_M * 100).toFixed(0)} cm)`;
     if (ornekler.length >= ORNEK_SAYISI) {
       const poz = ortalamaPoz(ornekler);
-      const tutarli = poz.kullanilan >= TUTARLILIK_ORAN * ORNEK_SAYISI && poz.yayilimMM <= TUTARLILIK_MM;
+      const tutarli = poz.kullanilan >= TUTARLILIK_ORAN * ORNEK_SAYISI && poz.yayilimMM <= TUTARLILIK_MM && yol >= MIN_KAMERA_YOLU_M;
       if (tutarli || beklemeKare > MAKS_BEKLEME_KARE) {
         kilitle(poz, frame, referansAlani);
         if (!tutarli) durum.textContent = `Kilitlendi ama ölçümler dağınıktı (±${poz.yayilimMM.toFixed(0)} mm). Gerekirse İşarete kilitle ile yenile.`;
       } else if (performance.now() - sonIpucuZamani > 400) {
-        durum.textContent = `Ölçümler tutarsız (±${poz.yayilimMM.toFixed(0)} mm) — telefonu sabit tut`;
+        durum.textContent = yol < MIN_KAMERA_YOLU_M
+          ? `Telefonu yavaşça biraz daha gezdir (${(yol * 100).toFixed(0)}/${(MIN_KAMERA_YOLU_M * 100).toFixed(0)} cm)`
+          : `Ölçümler tutarsız (±${poz.yayilimMM.toFixed(0)} mm) — daha yavaş hareket et`;
         sonIpucuZamani = performance.now();
       }
     }
@@ -515,6 +524,14 @@ function isaretGoruldu(poz, frame, referansAlani) {
       bilgi.textContent = 'Hizalama kaymış görünüyor, yeniden ölçülüyor. Telefonu sabit tut.';
     }
   }
+}
+
+// Ölçüm sırasında kameranın kat ettiği yayılım (en uzak iki konum arası, kabaca)
+function kameraYayilimi() {
+  if (kameraYolu.length < 2) return 0;
+  let mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+  for (const k of kameraYolu) for (let i = 0; i < 3; i++) { if (k[i] < mn[i]) mn[i] = k[i]; if (k[i] > mx[i]) mx[i] = k[i]; }
+  return Math.hypot(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]);
 }
 
 // İşaretin o karede yeterince iyi görüldüğünü denetler; sorun varsa kullanıcıya ipucu döndürür, yoksa ''.
@@ -606,7 +623,7 @@ function kilitle(poz, frame, referansAlani) {
 function kilidiAc() {
   if (capa && typeof capa.delete === 'function') { try { capa.delete(); } catch (e) {} }
   capa = null; sabitMatris = null; kilitli = false; capaIsteniyor = false;
-  ornekler = []; sapmaKare = 0; elenenOrnek = 0; beklemeKare = 0; zeminY = [];
+  ornekler = []; sapmaKare = 0; elenenOrnek = 0; beklemeKare = 0; zeminY = []; kameraYolu = [];
 }
 
 function elleYerlestir() {
